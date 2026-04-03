@@ -2,7 +2,7 @@
 
 Implémentation Node.js du protocole **OGLAP** (Offline Grid Location Addressing Protocol) — un système d'adressage déterministe basé sur une grille, conçu pour les régions où les adresses postales formelles sont inexistantes ou peu fiables.
 
-OGLAP génère des **codes LAP** compacts et lisibles (ex. `GN-CKY-QKAR-B4A4-2798`) qui identifient de façon unique n'importe quelle coordonnée à l'intérieur d'un pays configuré, hors ligne et sans API externe.
+OGLAP génère des **codes LAP** compacts et lisibles (ex. `GN-CON-QYTC-B0B1-2282`) qui identifient de façon unique n'importe quelle coordonnée à l'intérieur d'un pays configuré, hors ligne et sans API externe.
 
 ---
 
@@ -23,22 +23,22 @@ Un code LAP encode une localisation à quatre niveaux hiérarchiques :
 
 ### Grille locale (5 segments)
 ```
-GN  - CKY  - QKAR - B4A4 - 2798
-│      │      │      │      └─ Microspot   — 4 chiffres, offset métrique (XX = est, YY = nord)
+GN  - CON  - QYTC - B0B1 - 2282
+│      │      │      │      └─ Microspot  — 4 chiffres, offset métrique (XX = est, YY = nord)
 │      │      │      └─────── Macrobloc   — 4 chars [A-J][0-9][A-J][0-9], blocs ~100 m dans la zone
-│      │      └────────────── Zone        — 4 chars, dérivé du nom de lieu local
-│      └───────────────────── Région      — 3 chars, code de région administrative
-└──────────────────────────── Pays        — code ISO alpha-2 du pays
+│      │      └────────────── Zone        — 4 chars, indiquant la localite administrative immediate de niveau 8 et plus   (example - QYTC pour Yattaya - Fossedè)
+│      └───────────────────── Région      — 3 chars, code de la localite administrative de niveau 4 ou 6 immediate (example - CON pour Conakry)
+└──────────────────────────── Pays        — code ISO alpha-2 du pays (example - gn pour Guinee)
 ```
 
 ### Grille nationale (4 segments)
 Utilisée quand une coordonnée se situe en dehors des limites administratives de niveau 8 et au-dessus :
 ```
-GN  - CKY  - AABCDE - 4250
+GN  - NZE  - AABCDE - 4250
 │      │      │        └─ Microspot   — 4 chiffres
 │      │      └────────── Macrobloc   — 6 lettres, grille kilométrique nationale
-│      └──────────────── Région
-└─────────────────────── Pays
+│      └──────────────── Région       — 3 chars, code de la localite administrative de niveau 4 ou 6 immediate (example - NZE pour Nzérékoré)
+└─────────────────────── Pays         — code ISO alpha-2 du pays (example - gn pour Guinee)
 ```
 
 ---
@@ -85,22 +85,6 @@ const report = await initOglap({
 if (!report.ok) throw new Error(report.error);
 ```
 
-**Mode direct** — pour les environnements sans accès disque (serverless, edge) :
-
-```js
-import { initOglap, loadOglap } from 'oglap-ggp-node-js';
-
-const profile    = await fetch('/data/country_profile.json').then(r => r.json());
-const localities = await fetch('/data/localities_naming.json').then(r => r.json());
-const places     = await fetch('/data/oglap_data.json').then(r => r.json());
-
-const report = await initOglap(profile, localities);
-if (!report.ok) throw new Error(report.error);
-
-const loaded = loadOglap(places);
-console.log(`${loaded.count} lieux chargés`);
-```
-
 ---
 
 ## Utilisation
@@ -112,12 +96,12 @@ import { coordinatesToLap } from 'oglap-ggp-node-js';
 
 const result = coordinatesToLap(9.5370, -13.6773); // lat, lon — Conakry, Guinée
 
-console.log(result.lapCode);        // GN-CKY-QKAR-B4A4-2798
-console.log(result.humanAddress);   // Quartier Almamya, Conakry, Kindia, Guinée
-console.log(result.admin_level_2);  // CKY  (code de région)
-console.log(result.admin_level_3);  // QKAR (code de zone)
-console.log(result.macroblock);     // B4A4
-console.log(result.microspot);      // 2798
+console.log(result.lapCode);        // GN-CON-QYTC-B0B1-2282
+console.log(result.humanAddress);   // B0B1-2282, Yattaya Fossedè, Conakry, Guinée
+console.log(result.admin_level_2);  // CON  (code de région)
+console.log(result.admin_level_3);  // QYTC (code de zone)
+console.log(result.macroblock);     // B0B1
+console.log(result.microspot);      // 2282
 console.log(result.isNationalGrid); // false
 console.log(result.originLat);      // latitude d'origine de la bbox
 console.log(result.originLon);      // longitude d'origine de la bbox
@@ -130,7 +114,7 @@ Retourne `null` si les coordonnées sont hors du territoire.
 ```js
 import { lapToCoordinates } from 'oglap-ggp-node-js';
 
-const coords = lapToCoordinates('GN-CKY-QKAR-B4A4-2798');
+const coords = lapToCoordinates('GN-CON-QYTC-B0B1-2282');
 
 if (coords) {
   console.log(`lat: ${coords.lat}, lon: ${coords.lon}`);
@@ -138,7 +122,7 @@ if (coords) {
 }
 
 // Le préfixe pays est optionnel
-const coords2 = lapToCoordinates('CKY-QKAR-B4A4-2798');
+const coords2 = lapToCoordinates('GN-CON-QYTC-B0B1-2282');
 ```
 
 ### Parser et valider un code LAP
@@ -147,7 +131,7 @@ const coords2 = lapToCoordinates('CKY-QKAR-B4A4-2798');
 import { validateLapCode, parseLapCode } from 'oglap-ggp-node-js';
 
 // Valider — retourne un message d'erreur, ou null si valide
-const error = validateLapCode('GN-CKY-QKAR-B4A4-2798');
+const error = validateLapCode('GN-CON-QYTC-B0B1-2282');
 if (error) {
   console.log('Invalide :', error);
 } else {
@@ -155,18 +139,19 @@ if (error) {
 }
 
 // Parser en composants
-const parsed = parseLapCode('GN-CKY-QKAR-B4A4-2798');
+const parsed = parseLapCode('GN-CON-QYTC-B0B1-2282');
 if (parsed) {
-  console.log(parsed.admin_level_2_Iso);  // code ISO de la région
-  console.log(parsed.admin_level_3_code); // code de zone : QKAR
-  console.log(parsed.macroblock);         // B4A4
-  console.log(parsed.microspot);          // 2798
+  console.log(parsed.admin_level_2_Iso);  // code ISO du pays : GN
+  console.log(parsed.admin_level_3_code); // code de la localite administrative de niveau 4 ou 6 immediate : CON
+  console.log(parsed.admin_level_4_code); // code de la localite administrative de niveau 8 et plus : QYTC
+  console.log(parsed.macroblock);         // B0B1 macrobloc ~100m x 100m dans la zone
+  console.log(parsed.microspot);          // 2282 microspot ~1m x 1m dans la zone
   console.log(parsed.isNationalGrid);     // false
 }
 
 // Les codes partiels sont aussi supportés
-parseLapCode('GN-CKY-QKAR'); // région + zone seulement
-parseLapCode('QKAR');         // zone seulement
+parseLapCode('GN-CON-QYTC'); // région + zone seulement
+parseLapCode('QYTC');         // zone seulement
 ```
 
 ### Résoudre un code LAP vers un lieu
@@ -174,7 +159,7 @@ parseLapCode('QKAR');         // zone seulement
 ```js
 import { getPlaceByLapCode } from 'oglap-ggp-node-js';
 
-const resolved = getPlaceByLapCode('GN-CKY-QKAR-B4A4-2798');
+const resolved = getPlaceByLapCode('GN-CON-QYTC-B0B1-2282');
 
 if (resolved) {
   console.log(resolved.originLat); // latitude d'origine de la bbox
@@ -187,8 +172,8 @@ if (resolved) {
   }
 
   // Accéder aux composants parsés
-  console.log(resolved.parsed.macroblock); // B4A4
-  console.log(resolved.parsed.microspot);  // 2798
+  console.log(resolved.parsed.macroblock); // B0B1
+  console.log(resolved.parsed.microspot);  // 2282
 }
 ```
 
@@ -238,10 +223,10 @@ const prefectures = getOglapPrefectures();
 
 | Champ | Type | Description |
 |---|---|---|
-| `lapCode` | `string` | Code LAP complet, ex. `GN-CKY-QKAR-B4A4-2798` |
+| `lapCode` | `string` | Code LAP complet, ex. `GN-CON-QYTC-B0B1-2282` |
 | `country` | `string` | Code pays, ex. `GN` |
-| `admin_level_2` | `string` | Code de région, ex. `CKY` |
-| `admin_level_3` | `string\|null` | Code de zone, ex. `QKAR` |
+| `admin_level_2` | `string` | Code de région, ex. `CON` |
+| `admin_level_3` | `string\|null` | Code de zone, ex. `QYTC` |
 | `macroblock` | `string` | Composant macrobloc |
 | `microspot` | `string` | Composant microspot |
 | `isNationalGrid` | `boolean` | `true` si grille nationale utilisée |
@@ -362,25 +347,25 @@ class LocationService {
 // Utilisation
 await LocationService.init();
 
-// Encoder le centre de Conakry
-const code = LocationService.encodePosition(9.5370, -13.6773);
-console.log(code); // GN-CKY-QKAR-B4A4-2798
+// Encoder
+const code = LocationService.encodePosition(9.660147, -13.588009);
+console.log(code); // GN-CON-QYTC-B0B1-2282
 
 // Décoder
 const coords = LocationService.decodeToCoords(code);
-console.log(coords); // { lat: 9.537..., lon: -13.677... }
+console.log(coords); // { lat: 9.660147, lon: -13.588009 }
 
 // Partager
-const share = LocationService.shareLocation(9.5370, -13.6773);
-console.log(share.label); // Quartier Almamya, Conakry, Kindia, Guinée
+const share = LocationService.shareLocation(9.660147, -13.588009);
+console.log(share.label); // B0B1-2282, Yattaya Fossedè, Conakry, Guinée
 
 // Valider la saisie utilisateur
-const err = LocationService.validateInput('GN-CKY-QKAR-B4A4-2798');
+const err = LocationService.validateInput('GN-CON-QYTC-B0B1-2282');
 console.log(err); // null (valide)
 
 // Résoudre un lieu
-const place = LocationService.resolvePlace('GN-CKY-QKAR-B4A4-2798');
-console.log(place.name); // Quartier Almamya
+const place = LocationService.resolvePlace('GN-CON-QYTC-B0B1-2282');
+console.log(place.display_name); // Yattaya Fossedè, Ratoma, Conakry, Guinée
 ```
 
 ---
