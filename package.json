@@ -1,6 +1,6 @@
 {
   "name": "oglap-ggp-node-js",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OGLAP — Offline Grid Location Addressing Protocol. Node.js implementation of the Global Grid Protocol (GGP) for Guinea (GN).",
   "type": "module",
   "main": "oglap.js",
