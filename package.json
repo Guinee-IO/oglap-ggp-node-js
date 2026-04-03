@@ -1,0 +1,43 @@
+{
+  "name": "oglap-ggp-node",
+  "version": "1.0.1",
+  "description": "Permettre aux développeurs d'installer rapidement le SDK et ses dépendances pour commencer à l'utiliser dans leurs projets.",
+  "type": "module",
+  "main": "oglap.js",
+  "module": "oglap.js",
+  "exports": {
+    ".": {
+      "import": "./oglap.js",
+      "default": "./oglap.js"
+    }
+  },
+  "files": [
+    "oglap.js",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "@turf/boolean-point-in-polygon": "^7.2.0",
+    "@turf/area": "^7.2.0"
+  },
+  "keywords": [
+    "oglap",
+    "ggp",
+    "geocoding",
+    "coordinates",
+    "guinea",
+    "geolocation"
+  ],
+  "author": "Guinee IO",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guinee-IO/oglap-ggp-node-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Guinee-IO/oglap-ggp-node-js/issues"
+  },
+  "homepage": "https://github.com/Guinee-IO/oglap-ggp-node-js#readme"
+}
