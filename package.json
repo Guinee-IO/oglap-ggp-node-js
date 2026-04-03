@@ -1,0 +1,31 @@
+{
+  "name": "oglap-ggp-node-js",
+  "version": "0.1.1",
+  "description": "OGLAP — Offline Grid Location Addressing Protocol. Node.js implementation of the Global Grid Protocol (GGP) for Guinea (GN).",
+  "type": "module",
+  "main": "oglap.js",
+  "exports": {
+    ".": "./oglap.js"
+  },
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "oglap",
+    "ggp",
+    "geolocation",
+    "addressing",
+    "lap-code",
+    "offline",
+    "guinea",
+    "geocoding"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "@turf/area": "^7.2.0",
+    "@turf/boolean-point-in-polygon": "^7.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
