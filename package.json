@@ -1,7 +1,7 @@
 {
   "name": "oglap-ggp-node",
-  "version": "1.0.1",
-  "description": "Permettre aux développeurs d'installer rapidement le SDK et ses dépendances pour commencer à l'utiliser dans leurs projets.",
+  "version": "0.1.2",
+  "description": "Node.js SDK for the OGLAP protocol — Global Grid Protocol (GGP) geographic coordinate encoding for offline-first addressing.",
   "type": "module",
   "main": "oglap.js",
   "module": "oglap.js",
@@ -13,14 +13,17 @@
   },
   "files": [
     "oglap.js",
-    "LICENSE"
+    "LICENSE",
+    "README.md",
+    "README.fr.md"
   ],
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js && node determinism.test.js"
   },
   "dependencies": {
-    "@turf/boolean-point-in-polygon": "^7.2.0",
-    "@turf/area": "^7.2.0"
+    "@turf/area": "^7.0.0",
+    "@turf/boolean-point-in-polygon": "^7.0.0",
+    "flatbush": "^4.5.1"
   },
   "keywords": [
     "oglap",
@@ -28,7 +31,11 @@
     "geocoding",
     "coordinates",
     "guinea",
-    "geolocation"
+    "geolocation",
+    "offline",
+    "addressing",
+    "grid",
+    "lap"
   ],
   "author": "Guinee IO",
   "license": "ISC",

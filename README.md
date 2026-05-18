@@ -1,386 +1,452 @@
-# oglap-ggp-node-js
+# oglap-ggp-node
 
-Implémentation Node.js du protocole **OGLAP** (Offline Grid Location Addressing Protocol) — un système d'adressage déterministe basé sur une grille, conçu pour les régions où les adresses postales formelles sont inexistantes ou peu fiables.
+> Node.js SDK for the **OGLAP** protocol — Offline Grid Location Addressing for the Guinea Grid Profile (GGP).
 
-OGLAP génère des **codes LAP** compacts et lisibles (ex. `GN-CON-QYTC-B0B1-2282`) qui identifient de façon unique n'importe quelle coordonnée à l'intérieur d'un pays configuré, hors ligne et sans API externe.
+🇫🇷 **Version française** → [README.fr.md](README.fr.md)
 
----
+Convert GPS coordinates into compact, deterministic, human-readable address codes (e.g. `GN-CON-QYTC-B0B1-2282`) and back — fully offline, with no external API. Designed for regions where formal postal addressing is sparse or unreliable.
 
-## Fonctionnalités
-
-- **Coordonnées → code LAP** — encoder toute position GPS en adresse LAP structurée
-- **Code LAP → coordonnées** — décoder un code LAP vers son centre géographique
-- **Geocodage inversé** — trouver la région administrative, zone et lieu contenant une coordonnée
-- **Parsing & validation de code LAP** — analyser des codes partiels ou complets, valider le format et le contenu
-- **Boîte englobante et centroïde** — calculer bbox et centre à partir de géométries GeoJSON
-- **Entièrement hors ligne** — aucune connexion requise une fois les données chargées
+[![npm version](https://img.shields.io/npm/v/oglap-ggp-node.svg)](https://www.npmjs.com/package/oglap-ggp-node)
+[![license](https://img.shields.io/npm/l/oglap-ggp-node.svg)](LICENSE)
 
 ---
 
-## Format du code LAP
+## Table of contents
 
-Un code LAP encode une localisation à quatre niveaux hiérarchiques :
+- [Why OGLAP?](#why-oglap)
+- [The LAP code format](#the-lap-code-format)
+- [Installation](#installation)
+- [Initialization (required)](#initialization-required)
+- [Core API](#core-api)
+  - [`coordinatesToLap` — encode GPS → LAP](#coordinatestolap--encode-gps--lap)
+  - [`lapToCoordinates` — decode LAP → GPS](#laptocoordinates--decode-lap--gps)
+  - [`parseLapCode` — break a code into components](#parselapcode--break-a-code-into-components)
+  - [`validateLapCode` — validate a code](#validatelapcode--validate-a-code)
+  - [`getPlaceByLapCode` — look up the underlying place](#getplacebylapcode--look-up-the-underlying-place)
+  - [`bboxFromGeometry` & `centroidFromBbox`](#bboxfromgeometry--centroidfrombbox)
+  - [State & metadata helpers](#state--metadata-helpers)
+- [Data files & caching](#data-files--caching)
+- [End-to-end example](#end-to-end-example)
+- [Browser usage](#browser-usage)
+- [Performance notes](#performance-notes)
+- [Testing](#testing)
+- [Versioning & compatibility](#versioning--compatibility)
+- [License](#license)
 
-### Grille locale (5 segments)
+---
+
+## Why OGLAP?
+
+In many parts of the world, conventional street addresses don't exist or aren't reliable enough to route deliveries, dispatch emergency services, or share a location with a friend. OGLAP solves this by carving the country into a deterministic grid and giving every ~1 m × 1 m cell a short, copy-pasteable code.
+
+- **Offline-first** — works without network once reference data is cached.
+- **Deterministic** — same coordinates always produce the same code; same code always decodes back to the same point.
+- **Hierarchical** — the prefix reveals the country / region / zone, so the code is meaningful even when truncated.
+- **Human-readable** — uppercase A–Z and digits only, no ambiguous characters.
+
+---
+
+## The LAP code format
+
+A LAP code encodes a location at four hierarchical levels. Two grid strategies coexist:
+
+### Local grid (5 segments — used inside named administrative zones)
+
 ```
 GN  - CON  - QYTC - B0B1 - 2282
-│      │      │      │      └─ Microspot  — 4 chiffres, offset métrique (XX = est, YY = nord)
-│      │      │      └─────── Macrobloc   — 4 chars [A-J][0-9][A-J][0-9], blocs ~100 m dans la zone
-│      │      └────────────── Zone        — 4 chars, indiquant la localite administrative immediate de niveau 8 et plus   (example - QYTC pour Yattaya - Fossedè)
-│      └───────────────────── Région      — 3 chars, code de la localite administrative de niveau 4 ou 6 immediate (example - CON pour Conakry)
-└──────────────────────────── Pays        — code ISO alpha-2 du pays (example - gn pour Guinee)
+│      │      │      │      └─ Microspot   — 4 digits, ~1 m offset inside the macroblock
+│      │      │      └─────── Macroblock   — 4 chars [A–J][0–9][A–J][0–9], ~100 m cell inside the zone
+│      │      └────────────── Zone         — 4 chars, immediate admin level ≥8 (e.g. QYTC for Yattaya-Fossedè)
+│      └───────────────────── Region       — 3 chars, immediate admin level 4 or 6 (e.g. CON for Conakry)
+└──────────────────────────── Country      — ISO alpha-2 (e.g. GN for Guinea)
 ```
 
-### Grille nationale (4 segments)
-Utilisée quand une coordonnée se situe en dehors des limites administratives de niveau 8 et au-dessus :
+### National grid (4 segments — fallback for rural areas without admin level ≥8 coverage)
+
 ```
 GN  - NZE  - AABCDE - 4250
-│      │      │        └─ Microspot   — 4 chiffres
-│      │      └────────── Macrobloc   — 6 lettres, grille kilométrique nationale
-│      └──────────────── Région       — 3 chars, code de la localite administrative de niveau 4 ou 6 immediate (example - NZE pour Nzérékoré)
-└─────────────────────── Pays         — code ISO alpha-2 du pays (example - gn pour Guinee)
+│      │      │        └─ Microspot   — 4 digits, ~1 m offset
+│      │      └────────── Macroblock   — 6 letters, country-wide kilometric grid
+│      └──────────────── Region       — 3 chars (e.g. NZE for Nzérékoré)
+└─────────────────────── Country      — ISO alpha-2
 ```
+
+The SDK transparently picks the right grid based on whether the input coordinate falls inside a named admin level ≥8 polygon.
 
 ---
 
-## Démarrage
-
-### 1. Ajouter la dépendance
+## Installation
 
 ```bash
-npm install oglap-ggp-node-js
+npm install oglap-ggp-node
+# or
+pnpm add oglap-ggp-node
+# or
+yarn add oglap-ggp-node
 ```
 
-### 2. Préparer les données
+Requires **Node.js ≥ 18** (uses native `fetch`, ES Modules, `WeakMap`).
 
-Le package nécessite trois fichiers JSON :
+The package is published as an **ES Module** — use `import` syntax. If you need CommonJS, use dynamic `import()`.
 
-| Fichier | Description |
-|---|---|
-| `{country_code}_oglap_country_profile.json` | Paramètres de grille, codes admin, règles de nommage |
-| `{country_code}_localities_naming.json` | Géométries GeoJSON des lieux (régions, zones, localités) |
-| `{country_code}_full.json` | Correspondances place-ID → code OGLAP |
+---
 
-### 3. Initialiser avant toute utilisation
+## Initialization (required)
 
-Appeler `initOglap` une seule fois au démarrage de l'application, avant toute autre fonction :
-
-**Mode téléchargement (recommandé)** — les données sont téléchargées et mises en cache localement :
+You must call `initOglap()` **once** at application startup before any encoding/decoding function. On first run it downloads three JSON files from the OGLAP CDN (`https://s3.guinee.io/oglap/ggp/latest/`) and caches them under `oglap-data/<version>/`. Subsequent runs load from the cache instantly.
 
 ```js
-import { initOglap } from 'oglap-ggp-node-js';
+import { initOglap } from 'oglap-ggp-node';
 
 const report = await initOglap({
-  version: 'latest',
-  dataDir: 'oglap-data',      // dossier de cache local
-  forceDownload: false,
+  version: 'latest',          // 'latest' (default) or a pinned dataset version
+  dataDir: 'oglap-data',      // local cache directory (default: 'oglap-data')
+  forceDownload: false,       // re-download even if cache is present
   onProgress({ label, status, percent, step, totalSteps }) {
-    if (status === 'downloading') process.stdout.write(`\r↓ [${step}/${totalSteps}] ${label}: ${percent}%`);
-    if (status === 'cached')      console.log(`⚡ [${step}/${totalSteps}] ${label}: depuis le cache`);
-    if (status === 'done')        console.log(`\r✓ [${step}/${totalSteps}] ${label}: terminé`);
-    if (status === 'error')       console.log(`✗ [${step}/${totalSteps}] ${label}: erreur`);
-  }
+    // status ∈ 'downloading' | 'cached' | 'slow' | 'validating' | 'done' | 'error'
+    if (status === 'downloading') {
+      process.stdout.write(`\r↓ [${step}/${totalSteps}] ${label}: ${percent}%`);
+    } else if (status === 'cached') {
+      console.log(`⚡ [${step}/${totalSteps}] ${label}: loaded from cache`);
+    } else if (status === 'done') {
+      console.log(`✓ [${step}/${totalSteps}] ${label}: ready`);
+    } else if (status === 'error') {
+      console.error(`✗ [${step}/${totalSteps}] ${label}: error`);
+    }
+  },
 });
 
+if (!report.ok) throw new Error(`OGLAP init failed: ${report.error}`);
+```
+
+### Init report shape
+
+| Field         | Type                  | Description                                                                 |
+| ------------- | --------------------- | --------------------------------------------------------------------------- |
+| `ok`          | `boolean`             | `true` if initialization succeeded                                          |
+| `countryCode` | `string \| null`      | Active country code, e.g. `"GN"`                                            |
+| `countryName` | `string \| null`      | Display name, e.g. `"Guinea"`                                               |
+| `bounds`      | `number[][] \| null`  | `[[swLat, swLon], [neLat, neLon]]`                                          |
+| `checks`      | `Array<Check>`        | Per-step validation results — each `{ id, status, message }`                |
+| `error`       | `string \| null`      | First fatal error message if `!ok`                                          |
+| `dataDir`     | `string`              | Resolved local cache directory                                              |
+| `dataLoaded`  | `{ ok, count, message }` | Places loaded into the in-memory engine                                  |
+
+### Direct mode (bring your own data)
+
+If you already have the JSON files in memory (e.g. fetched yourself or bundled with the app), skip the download:
+
+```js
+import { initOglap } from 'oglap-ggp-node';
+import profile from './my-profile.json' with { type: 'json' };
+import localities from './my-localities.json' with { type: 'json' };
+import places from './my-places.json' with { type: 'json' };
+import { loadOglap } from 'oglap-ggp-node';
+
+const report = await initOglap(profile, localities);
 if (!report.ok) throw new Error(report.error);
+
+loadOglap(places); // load the places database into the engine
 ```
 
 ---
 
-## Utilisation
+## Core API
 
-### Encoder des coordonnées en code LAP
+All functions below are **synchronous** (no network, pure in-memory computation) except `initOglap`.
+
+### `coordinatesToLap` — encode GPS → LAP
 
 ```js
-import { coordinatesToLap } from 'oglap-ggp-node-js';
+import { coordinatesToLap } from 'oglap-ggp-node';
 
-const result = coordinatesToLap(9.5370, -13.6773); // lat, lon — Conakry, Guinée
+const result = coordinatesToLap(9.5370, -13.6773); // lat, lon
 
-console.log(result.lapCode);        // GN-CON-QYTC-B0B1-2282
-console.log(result.humanAddress);   // B0B1-2282, Yattaya Fossedè, Conakry, Guinée
-console.log(result.admin_level_2);  // CON  (code de région)
-console.log(result.admin_level_3);  // QYTC (code de zone)
-console.log(result.macroblock);     // B0B1
-console.log(result.microspot);      // 2282
+console.log(result.lapCode);        // 'GN-CON-QYTC-B0B1-2282'
+console.log(result.humanAddress);   // 'B0B1-2282, Yattaya Fossedè, Conakry, Guinea'
 console.log(result.isNationalGrid); // false
-console.log(result.originLat);      // latitude d'origine de la bbox
-console.log(result.originLon);      // longitude d'origine de la bbox
 ```
 
-Retourne `null` si les coordonnées sont hors du territoire.
+Returns `null` if the coordinates fall outside the country (verified via 3-layer check: bounding box → country polygon → admin polygon).
 
-### Décoder un code LAP en coordonnées
+**Result shape:**
+
+| Field            | Type        | Description                                                            |
+| ---------------- | ----------- | ---------------------------------------------------------------------- |
+| `lapCode`        | `string`    | Full code, e.g. `"GN-CON-QYTC-B0B1-2282"`                              |
+| `country`        | `string`    | Country code, e.g. `"GN"`                                              |
+| `admin_level_2`  | `string`    | Region code, e.g. `"CON"`                                              |
+| `admin_level_3`  | `string\|null` | Zone code (null when national-grid)                                 |
+| `macroblock`     | `string`    | Macroblock segment                                                     |
+| `microspot`      | `string`    | Microspot segment                                                      |
+| `isNationalGrid` | `boolean`   | `true` if national-grid (rural) was used                               |
+| `displayName`    | `string`    | Reverse-geocoded display name                                          |
+| `humanAddress`   | `string`    | Comma-joined human-readable address                                    |
+| `address`        | `object`    | Structured address components                                          |
+| `originLat`      | `number`    | Latitude origin of the macroblock bounding box                         |
+| `originLon`      | `number`    | Longitude origin of the macroblock bounding box                        |
+| `pcode`          | `string[]`  | UNOCHA P-codes for the matched admin units (when available)            |
+
+### `lapToCoordinates` — decode LAP → GPS
 
 ```js
-import { lapToCoordinates } from 'oglap-ggp-node-js';
+import { lapToCoordinates } from 'oglap-ggp-node';
 
 const coords = lapToCoordinates('GN-CON-QYTC-B0B1-2282');
+// { lat: 9.5370, lon: -13.6773 }
 
-if (coords) {
-  console.log(`lat: ${coords.lat}, lon: ${coords.lon}`);
-  // lat: 9.5370..., lon: -13.6773...
-}
-
-// Le préfixe pays est optionnel
-const coords2 = lapToCoordinates('GN-CON-QYTC-B0B1-2282');
+// The country prefix is optional:
+lapToCoordinates('CON-QYTC-B0B1-2282'); // same result
 ```
 
-### Parser et valider un code LAP
+Returns `null` if the code is structurally invalid or references an unknown region/zone.
+
+### `parseLapCode` — break a code into components
 
 ```js
-import { validateLapCode, parseLapCode } from 'oglap-ggp-node-js';
+import { parseLapCode } from 'oglap-ggp-node';
 
-// Valider — retourne un message d'erreur, ou null si valide
-const error = validateLapCode('GN-CON-QYTC-B0B1-2282');
-if (error) {
-  console.log('Invalide :', error);
-} else {
-  console.log('Code valide');
-}
-
-// Parser en composants
 const parsed = parseLapCode('GN-CON-QYTC-B0B1-2282');
-if (parsed) {
-  console.log(parsed.admin_level_2_Iso);  // code ISO du pays : GN
-  console.log(parsed.admin_level_3_code); // code de la localite administrative de niveau 4 ou 6 immediate : CON
-  console.log(parsed.admin_level_4_code); // code de la localite administrative de niveau 8 et plus : QYTC
-  console.log(parsed.macroblock);         // B0B1 macrobloc ~100m x 100m dans la zone
-  console.log(parsed.microspot);          // 2282 microspot ~1m x 1m dans la zone
-  console.log(parsed.isNationalGrid);     // false
-}
+// {
+//   admin_level_2_Iso:  'GN-C',   // ISO key of the region (CON resolves to its OSM-style key)
+//   admin_level_3_code: 'QYTC',   // zone short code
+//   macroblock:         'B0B1',
+//   microspot:          '2282',
+//   isNationalGrid:     false,
+// }
 
-// Les codes partiels sont aussi supportés
-parseLapCode('GN-CON-QYTC'); // région + zone seulement
-parseLapCode('QYTC');         // zone seulement
+// Partial codes also parse:
+parseLapCode('GN-CON-QYTC'); // region + zone only — returns { admin_level_2_Iso, admin_level_3_code }
+parseLapCode('QYTC');        // zone only          — returns { admin_level_3_code }
 ```
 
-### Résoudre un code LAP vers un lieu
+> **Note:** the country code (`GN`) is *not* a field on the parsed object — it's implicit and you can read it with `getCountryCode()`. The region segment (e.g. `CON`) is exposed as `admin_level_2_Iso` (the OSM-style ISO key, e.g. `GN-C`), not as the 3-letter LAP short code. Use `getOglapPrefectures()` to map between the two if you need the short code.
+
+### `validateLapCode` — validate a code
 
 ```js
-import { getPlaceByLapCode } from 'oglap-ggp-node-js';
+import { validateLapCode } from 'oglap-ggp-node';
+
+validateLapCode('GN-CON-QYTC-B0B1-2282'); // → null  (valid)
+validateLapCode('GN-XXX-INVALID');        // → 'Unknown region code "XXX"'
+```
+
+Returns `null` for valid codes, or an English error message string for invalid ones.
+
+### `getPlaceByLapCode` — look up the underlying place
+
+```js
+import { getPlaceByLapCode } from 'oglap-ggp-node';
 
 const resolved = getPlaceByLapCode('GN-CON-QYTC-B0B1-2282');
+// {
+//   place: { place_id, address: { ... }, geojson: { ... }, display_name, ... },
+//   parsed: { admin_level_2_Iso, admin_level_3_code, ... },
+//   // originLat, originLon are present only when isNationalGrid is true
+// }
 
-if (resolved) {
-  console.log(resolved.originLat); // latitude d'origine de la bbox
-  console.log(resolved.originLon); // longitude d'origine de la bbox
-
-  if (resolved.place) {
-    const addr = resolved.place.address;
-    const name = addr?.village ?? addr?.town ?? addr?.city ?? resolved.place.display_name;
-    console.log(name); // nom du lieu lisible
-  }
-
-  // Accéder aux composants parsés
-  console.log(resolved.parsed.macroblock); // B0B1
-  console.log(resolved.parsed.microspot);  // 2282
-}
+const name = resolved.place.address.village
+          ?? resolved.place.address.town
+          ?? resolved.place.address.city
+          ?? resolved.place.display_name;
 ```
 
-### Boîte englobante et centroïde
+For national-grid codes, `place` is `null` (they do not bind to a named place) and the response carries `originLat`/`originLon` set to the country's south-west origin point — usable as a coarse fallback location.
+
+### `bboxFromGeometry` & `centroidFromBbox`
+
+Geometry helpers for working with GeoJSON shapes the SDK loads internally.
 
 ```js
-import { bboxFromGeometry, centroidFromBbox } from 'oglap-ggp-node-js';
+import { bboxFromGeometry, centroidFromBbox } from 'oglap-ggp-node';
 
 const geometry = {
   type: 'Polygon',
-  coordinates: [[
-    [-13.70, 9.50],
-    [-13.65, 9.50],
-    [-13.65, 9.55],
-    [-13.70, 9.55],
-    [-13.70, 9.50],
-  ]]
+  coordinates: [[[-13.70, 9.50], [-13.65, 9.50], [-13.65, 9.55], [-13.70, 9.55], [-13.70, 9.50]]],
 };
 
-const bbox = bboxFromGeometry(geometry);
-// [minLat, maxLat, minLon, maxLon]
-
-if (bbox) {
-  const center = centroidFromBbox(bbox);
-  // [lat, lon] du point central de la bbox
-  console.log(`Centre : ${center[0]}, ${center[1]}`);
-}
+const bbox = bboxFromGeometry(geometry);   // [minLat, maxLat, minLon, maxLon]
+const center = centroidFromBbox(bbox);     // [lat, lon]
 ```
 
-### Accéder aux métadonnées du pays
+### State & metadata helpers
 
 ```js
-import { getCountryCode, getCountrySW, getOglapPrefectures } from 'oglap-ggp-node-js';
+import {
+  checkOglap,
+  getPackageVersion,
+  getCountryCode,
+  getCountrySW,
+  getCountryProfile,
+  getOglapPrefectures,
+  getOglapPlaces,
+} from 'oglap-ggp-node';
 
-console.log(getCountryCode()); // "GN"
-console.log(getCountrySW());   // [lat, lon] du coin sud-ouest
-
-const prefectures = getOglapPrefectures();
-// { [isoCode]: prefectureOglapCode, ... }
+checkOglap();                // → init report (the same shape initOglap returned)
+getPackageVersion();         // → '0.1.2'
+getCountryCode();            // → 'GN'
+getCountrySW();              // → [7.19, -15.37]
+getCountryProfile();         // → the loaded country profile object
+getOglapPrefectures();       // → { 'GN.CON': 'CON', 'GN.NZE': 'NZE', ... }
+getOglapPlaces();            // → Place[]   (the loaded places array — use sparingly, large)
 ```
 
 ---
 
-## Modèles de données
+## Data files & caching
 
-### Résultat de `coordinatesToLap`
+The SDK loads three reference files from `https://s3.guinee.io/oglap/ggp/<version>/`:
 
-| Champ | Type | Description |
-|---|---|---|
-| `lapCode` | `string` | Code LAP complet, ex. `GN-CON-QYTC-B0B1-2282` |
-| `country` | `string` | Code pays, ex. `GN` |
-| `admin_level_2` | `string` | Code de région, ex. `CON` |
-| `admin_level_3` | `string\|null` | Code de zone, ex. `QYTC` |
-| `macroblock` | `string` | Composant macrobloc |
-| `microspot` | `string` | Composant microspot |
-| `isNationalGrid` | `boolean` | `true` si grille nationale utilisée |
-| `displayName` | `string` | Nom du lieu issu du geocodage inversé |
-| `humanAddress` | `string` | Adresse complète lisible |
-| `address` | `object` | Composants d'adresse structurés |
-| `originLat` | `number` | Latitude d'origine de la bbox |
-| `originLon` | `number` | Longitude d'origine de la bbox |
-| `pcode` | `string[]` | P-codes UNOCHA pour la localisation |
+| File                                | Size  | Description                                                              |
+| ----------------------------------- | ----- | ------------------------------------------------------------------------ |
+| `gn_oglap_country_profile.json`     | ~3 KB | Grid parameters, admin codes, naming rules, compatibility range          |
+| `gn_localities_naming.json`         | ~300 KB | Naming table for regions / prefectures / zones                         |
+| `gn_full.json`                      | ~37 MB | Places database with GeoJSON polygons                                   |
 
-### Résultat de `parseLapCode`
+By default they are cached to `./oglap-data/latest/`. The cache directory is **gitignored** in this repo and should be gitignored in yours too — these files are reproducibly downloaded by `initOglap()`.
 
-| Champ | Type | Description |
-|---|---|---|
-| `admin_level_2_Iso` | `string\|undefined` | Code ISO de la région |
-| `admin_level_3_code` | `string\|undefined` | Code de zone |
-| `macroblock` | `string\|undefined` | Composant macrobloc |
-| `microspot` | `string\|undefined` | Composant microspot |
-| `isNationalGrid` | `boolean` | `true` si grille nationale |
+The first call to `initOglap()` will display a progress callback while downloading; subsequent calls in the same process or across restarts hit the cache (`status === 'cached'`).
 
-### Résultat de `getPlaceByLapCode`
+To force a re-download (e.g. after a dataset update is published):
 
-| Champ | Type | Description |
-|---|---|---|
-| `place` | `object\|null` | Données OSM du lieu |
-| `parsed` | `object` | Composants LAP parsés |
-| `originLat` | `number\|undefined` | Latitude d'origine de la bbox |
-| `originLon` | `number\|undefined` | Longitude d'origine de la bbox |
-
-### Rapport de `initOglap`
-
-| Champ | Type | Description |
-|---|---|---|
-| `ok` | `boolean` | Initialisation réussie |
-| `countryCode` | `string\|null` | Ex. `GN` |
-| `countryName` | `string\|null` | Ex. `Guinée` |
-| `bounds` | `number[][]\|null` | `[[swLat, swLon], [neLat, neLon]]` |
-| `checks` | `Array` | Résultats de validation (`pass`, `warn`, `fail`) |
-| `error` | `string\|null` | Message d'erreur si `!ok` |
-| `dataDir` | `string\|undefined` | Dossier de cache local |
-| `dataLoaded` | `object\|undefined` | Résultat du chargement des lieux |
+```js
+await initOglap({ forceDownload: true });
+```
 
 ---
 
-## Exemple complet de bout en bout
+## End-to-end example
 
 ```js
 import {
   initOglap,
-  checkOglap,
   coordinatesToLap,
   lapToCoordinates,
-  getPlaceByLapCode,
   validateLapCode,
-  parseLapCode,
-} from 'oglap-ggp-node-js';
+  getPlaceByLapCode,
+} from 'oglap-ggp-node';
 
 class LocationService {
-  static #initialized = false;
+  static #ready = false;
 
   static async init() {
-    if (this.#initialized) return;
-
+    if (this.#ready) return;
     const report = await initOglap({
       onProgress({ label, status, percent, step, totalSteps }) {
         if (status === 'downloading') process.stdout.write(`\r↓ [${step}/${totalSteps}] ${label}: ${percent}%`);
-        if (status === 'cached')      console.log(`⚡ [${step}/${totalSteps}] ${label}: depuis le cache`);
-        if (status === 'done')        console.log(`\r✓ [${step}/${totalSteps}] ${label}: terminé`);
-        if (status === 'error')       console.log(`✗ [${step}/${totalSteps}] ${label}: erreur`);
-      }
+        if (status === 'cached')      console.log(`⚡ [${step}/${totalSteps}] ${label}: cached`);
+        if (status === 'done')        console.log(`✓ [${step}/${totalSteps}] ${label}: ready`);
+      },
     });
-
-    if (!report.ok) throw new Error(`Initialisation OGLAP échouée : ${report.error}`);
-    this.#initialized = true;
+    if (!report.ok) throw new Error(`OGLAP init failed: ${report.error}`);
+    this.#ready = true;
   }
 
-  /** Encoder la position GPS de l'utilisateur */
-  static encodePosition(lat, lon) {
-    const result = coordinatesToLap(lat, lon);
-    return result?.lapCode ?? null;
+  /** Encode the user's GPS position into a LAP code. */
+  static encode(lat, lon) {
+    return coordinatesToLap(lat, lon)?.lapCode ?? null;
   }
 
-  /** Partager une localisation : retourne le code LAP et l'adresse lisible */
-  static shareLocation(lat, lon) {
-    const result = coordinatesToLap(lat, lon);
-    if (!result) return null;
+  /** Decode a LAP code into a {lat, lon} pair. */
+  static decode(code) {
+    return lapToCoordinates(code); // null if invalid
+  }
+
+  /** Validate user-typed input. Returns null if valid, an error string otherwise. */
+  static validate(code) {
+    return validateLapCode(code);
+  }
+
+  /** Resolve a LAP code into a human-readable place card. */
+  static resolve(code) {
+    const r = getPlaceByLapCode(code);
+    if (!r?.place) return null;
+    const a = r.place.address ?? {};
     return {
-      code:  result.lapCode,
-      label: result.humanAddress,
-    };
-  }
-
-  /** Naviguer vers un code LAP en le convertissant en coordonnées */
-  static decodeToCoords(lapCode) {
-    return lapToCoordinates(lapCode); // { lat, lon } ou null
-  }
-
-  /** Valider la saisie d'un code LAP par l'utilisateur */
-  static validateInput(input) {
-    return validateLapCode(input); // null = valide, string = message d'erreur
-  }
-
-  /** Résoudre un code LAP vers les détails du lieu */
-  static resolvePlace(lapCode) {
-    const resolved = getPlaceByLapCode(lapCode);
-    if (!resolved?.place) return null;
-
-    const addr = resolved.place.address ?? {};
-    return {
-      name:      addr.village ?? addr.town ?? addr.city ?? resolved.place.display_name,
-      adminCode: resolved.parsed.admin_level_3_code,
-      originLat: resolved.originLat,
-      originLon: resolved.originLon,
+      name:      a.village ?? a.town ?? a.city ?? r.place.display_name,
+      adminCode: r.parsed.admin_level_3_code,
+      originLat: r.originLat,
+      originLon: r.originLon,
     };
   }
 }
 
-// Utilisation
 await LocationService.init();
 
-// Encoder
-const code = LocationService.encodePosition(9.660147, -13.588009);
-console.log(code); // GN-CON-QYTC-B0B1-2282
-
-// Décoder
-const coords = LocationService.decodeToCoords(code);
-console.log(coords); // { lat: 9.660147, lon: -13.588009 }
-
-// Partager
-const share = LocationService.shareLocation(9.660147, -13.588009);
-console.log(share.label); // B0B1-2282, Yattaya Fossedè, Conakry, Guinée
-
-// Valider la saisie utilisateur
-const err = LocationService.validateInput('GN-CON-QYTC-B0B1-2282');
-console.log(err); // null (valide)
-
-// Résoudre un lieu
-const place = LocationService.resolvePlace('GN-CON-QYTC-B0B1-2282');
-console.log(place.display_name); // Yattaya Fossedè, Ratoma, Conakry, Guinée
+const code = LocationService.encode(9.660147, -13.588009);
+console.log(code);                       // 'GN-CON-QYTC-B0B1-2282'
+console.log(LocationService.decode(code)); // { lat: ~9.660, lon: ~-13.588 }
+console.log(LocationService.validate(code)); // null  (valid)
+console.log(LocationService.resolve(code));  // { name: 'Yattaya Fossedè', ... }
 ```
 
 ---
 
-## Exécuter les tests
+## Browser usage
+
+The SDK is browser-compatible if you bring your own data (the bundled `_download.js` path uses Node's `fs`). Use direct mode:
+
+```js
+import { initOglap, loadOglap, coordinatesToLap } from 'oglap-ggp-node';
+
+const [profile, localities, places] = await Promise.all([
+  fetch('/oglap/gn_oglap_country_profile.json').then(r => r.json()),
+  fetch('/oglap/gn_localities_naming.json').then(r => r.json()),
+  fetch('/oglap/gn_full.json').then(r => r.json()),
+]);
+
+const report = await initOglap(profile, localities);
+if (!report.ok) throw new Error(report.error);
+loadOglap(places);
+
+const code = coordinatesToLap(9.5370, -13.6773).lapCode;
+```
+
+> ⚠️ The `gn_full.json` places database is ~37 MB uncompressed. For browser use, serve it pre-gzipped and consider lazy-loading after first paint.
+
+---
+
+## Performance notes
+
+- **R-tree spatial index** — `coordinatesToLap` uses a [Flatbush](https://github.com/mourner/flatbush) R-tree built once at `loadOglap()` time. Reverse-geocoding a single coordinate is O(log N) candidate lookup + a small polygon-in-polygon check.
+- **Non-mutating geometry caches** — bbox and area calculations are memoized via `WeakMap` keyed on the input place object. The SDK never mutates inputs.
+- **Bounded regex** — all regex scans run against bounded, sanitized strings — no ReDoS exposure on malformed user input.
+- **Serverless-friendly** — pure in-memory state, no globals leak between requests as long as you reuse the module across invocations.
+
+---
+
+## Testing
+
+The repo ships two test scripts:
 
 ```bash
-node test.js
+npm test                       # runs both test.js and determinism.test.js
+node test.js                   # functional test — encode, decode, parse, validate, round-trips
+node determinism.test.js       # exhaustive determinism & stability checks
 ```
+
+Both reuse the cached `oglap-data/` if present.
 
 ---
 
-## Informations complémentaires
+## Versioning & compatibility
 
-- **Protocole** : OGLAP est conçu pour la Guinée (`GN`) mais configurable pour tout pays via le fichier profil JSON.
-- **Offline-first** : tout l'encodage et décodage est effectué localement avec les données chargées — aucun réseau requis.
-- **Déterministe** : les mêmes coordonnées produisent toujours le même code LAP, à données identiques.
-- **Bugs** : signaler les problèmes dans le dépôt principal Kiraa.
+The SDK declares a compatibility range with the country-profile dataset via a semver caret. The currently published `gn_oglap_country_profile.json` requires the SDK to satisfy `^0.1.0` — so this package follows the 0.1.x line. Major bumps in the dataset schema will be accompanied by a major bump here.
+
+You can inspect the loaded compatibility range at runtime:
+
+```js
+import { getCountryProfile } from 'oglap-ggp-node';
+console.log(getCountryProfile().compatibility);
+// { oglap_package_range: '^0.1.0', dataset_versions: ['2026-02-21T14:13:02.414Z'] }
+```
+
+If `initOglap()` fails with a compatibility error, either downgrade the SDK or update your cached dataset (`forceDownload: true`).
+
+---
+
+## License
+
+ISC — see [LICENSE](LICENSE).
+
+Issues and contributions: <https://github.com/Guinee-IO/oglap-ggp-node-js/issues>

@@ -7,7 +7,7 @@
  * OGLAP codes (e.g., GN-CKY-QKPC-B4A4-2798 / GN-CKY-QFEAA4-2798), and vice versa.
  *
  * Security & Performance notes:
- * - O(N) spatial lookups optimized via internal object geometry caching (`_computedBbox`, `_computedArea`).
+ * - Spatial lookups use a Flatbush R-tree and non-mutating WeakMap geometry caches.
  * - Regex operations safely scoped to bounded string inputs to prevent ReDoS.
  * - Entire dataset runs statically in memory, suitable for clientside or serverless environments.
  *
@@ -16,9 +16,10 @@
 
 import booleanPointInPolygon from '@turf/boolean-point-in-polygon';
 import area from '@turf/area';
+import Flatbush from 'flatbush';
 
 // --- PACKAGE IDENTITY ---
-const PACKAGE_VERSION = '0.1.0';
+const PACKAGE_VERSION = '0.1.2';
 
 // --- INITIALIZATION STATE ---
 let _initialized = false;
@@ -47,6 +48,8 @@ let OGLAP_COUNTRY_PREFECTURES = {};
 
 /** @type {Map<string|number, string>} Cache mapping place_id to specific zone codes */
 let OGLAP_ZONE_CODES_BY_ID = new Map();
+/** @type {Map<string, Set<string>>} Explicit localities naming zone codes reserved by parent region ISO */
+let OGLAP_EXPLICIT_ZONE_CODES_BY_REGION = new Map();
 
 let ZONE_TYPE_PREFIX_DEFAULT = 'Z';
 let ZONE_TYPE_PREFIX = {};
@@ -57,6 +60,10 @@ let COUNTRY_BOUNDS = { sw: [7.19, -15.37], ne: [12.68, -7.64] };
 /** @type {Object|null} Cached country border polygon (admin_level 2) for boundary checks */
 let COUNTRY_BORDER_GEOJSON = null;
 let METERS_PER_DEGREE_LAT = 111320;
+/** 'flat' (default, uses METERS_PER_DEGREE_LAT constant) or 'wgs84_ellipsoid' (NOAA polynomial — sub-meter accurate). */
+let DISTANCE_MODE = 'flat';
+/** True iff the country's lon range crosses the antimeridian (e.g. Fiji, Kiribati). Computed from COUNTRY_BOUNDS. */
+let COUNTRY_CROSSES_ANTIMERIDIAN = false;
 
 /** @returns {string} Current OGLAP package version */
 export function getPackageVersion() { return PACKAGE_VERSION; }
@@ -384,6 +391,82 @@ function _validateAndApply(profile, localitiesNaming, priorChecks = []) {
     pass('localities.zones', `Zone entries (levels 8/9/10): ${count} total.`);
   }
 
+  // Explicit zone codes are authoritative. If two entries in the same parent
+  // region claim the same zone code, a LAP cannot be decoded unambiguously.
+  const explicitZoneCodeRe = /^[A-Z0-9]{1,8}$/;
+  const explicitByRegion = new Map();
+  let explicitZoneCount = 0;
+  let missingExplicitRegion = 0;
+  for (const table of [
+    localitiesNaming.level_8_sous_prefectures || {},
+    localitiesNaming.level_9_villages || {},
+    localitiesNaming.level_10_quartiers || {},
+  ]) {
+    for (const entry of Object.values(table)) {
+      const code = typeof entry?.oglap_code === 'string' ? entry.oglap_code.trim().toUpperCase() : '';
+      if (!code) continue;
+      explicitZoneCount++;
+      if (!explicitZoneCodeRe.test(code)) {
+        fail('localities.zone_code.format', `Invalid explicit zone code "${entry.oglap_code}" for place_id=${entry?.place_id ?? '(unknown)'}. Codes must be 1-8 uppercase letters/digits.`);
+        continue;
+      }
+      const regionIso = entry?.parent_region_iso || null;
+      if (!regionIso) {
+        missingExplicitRegion++;
+        continue;
+      }
+      const key = `${regionIso}_${code}`;
+      if (!explicitByRegion.has(key)) explicitByRegion.set(key, []);
+      explicitByRegion.get(key).push(entry);
+    }
+  }
+  const explicitCollisions = [...explicitByRegion.entries()].filter(([, entries]) => entries.length > 1);
+  if (explicitCollisions.length > 0) {
+    const [key, entries] = explicitCollisions[0];
+    fail('localities.zone_code.unique',
+      `Duplicate explicit zone code in parent region (${key}): place_ids ${entries.map(e => e?.place_id ?? '(unknown)').join(', ')}. ` +
+      'Explicit zone codes must be unique within an ADMIN_LEVEL_2 region.');
+  } else if (explicitZoneCount > 0) {
+    pass('localities.zone_code.unique', `No duplicate explicit zone codes found within declared parent regions (${explicitZoneCount} entries scanned).`);
+  }
+  if (missingExplicitRegion > 0) {
+    warn('localities.zone_code.parent_region', `${missingExplicitRegion} explicit zone code entries have no parent_region_iso; uniqueness will be resolved from place geometry at load time.`);
+  }
+
+  // ── Geometry of country_extent must be well-formed numbers ────────
+  // Without this, a profile shipping `sw: "7.19,-15.37"` (string) would slip through
+  // because string OR fallback (a || b) returns the string. Then bbox math returns NaN
+  // everywhere, every encode/decode silently returns null, and there's no error to chase.
+  const _validLatLonPair = (p) =>
+    Array.isArray(p) && p.length === 2 && Number.isFinite(p[0]) && Number.isFinite(p[1]) &&
+    p[0] >= -90 && p[0] <= 90 && p[1] >= -180 && p[1] <= 180;
+  const csw = profile.country_extent?.country_sw;
+  const bsw = profile.country_extent?.country_bounds?.sw;
+  const bne = profile.country_extent?.country_bounds?.ne;
+  if (!_validLatLonPair(csw)) fail('profile.country_extent.country_sw', `country_sw must be [lat, lon] with finite numbers in WGS84 range. Got: ${JSON.stringify(csw)}.`);
+  if (!_validLatLonPair(bsw)) fail('profile.country_extent.country_bounds.sw', `country_bounds.sw must be [lat, lon]. Got: ${JSON.stringify(bsw)}.`);
+  if (!_validLatLonPair(bne)) fail('profile.country_extent.country_bounds.ne', `country_bounds.ne must be [lat, lon]. Got: ${JSON.stringify(bne)}.`);
+  if (_validLatLonPair(bsw) && _validLatLonPair(bne) && bne[0] < bsw[0]) {
+    fail('profile.country_extent.country_bounds', `country_bounds.ne.lat (${bne[0]}) must be ≥ country_bounds.sw.lat (${bsw[0]}). Lon may wrap (antimeridian), but lat must not.`);
+  }
+
+  // ── distance_mode validated BEFORE we mutate any module state ─────
+  // (A silent fallback would be dangerous: a typo like 'wgs84' would degrade to 'flat'
+  // and shift every LAP code by ~0.6 m.) We surface unknown values as a fatal check.
+  const requestedMode = profile.grid_settings?.distance_mode;
+  let validatedDistanceMode;
+  if (requestedMode == null) {
+    validatedDistanceMode = 'flat';
+    pass('grid_settings.distance_mode', 'distance_mode not specified — defaulting to "flat" (backward-compatible).');
+  } else if (requestedMode === 'flat' || requestedMode === 'wgs84_ellipsoid') {
+    validatedDistanceMode = requestedMode;
+    pass('grid_settings.distance_mode', `Distance mode: "${requestedMode}".`);
+  } else {
+    fail('grid_settings.distance_mode',
+      `Unknown distance_mode "${requestedMode}". Must be one of: "flat", "wgs84_ellipsoid". ` +
+      'A typo here would silently shift every LAP code, so init refuses to start.');
+  }
+
   // ── If any fatal check failed, abort before applying state ────────
   if (fatal) {
     return {
@@ -410,15 +493,25 @@ function _validateAndApply(profile, localitiesNaming, priorChecks = []) {
 
   // Cache zone codes by ID (levels 8, 9, 10)
   OGLAP_ZONE_CODES_BY_ID.clear();
+  OGLAP_EXPLICIT_ZONE_CODES_BY_REGION.clear();
   const zones = [
     ...(Object.values(localitiesNaming.level_8_sous_prefectures || {})),
     ...(Object.values(localitiesNaming.level_9_villages || {})),
     ...(Object.values(localitiesNaming.level_10_quartiers || {}))
   ];
   for (const z of zones) {
-    if (z.place_id && z.oglap_code) {
-      OGLAP_ZONE_CODES_BY_ID.set(z.place_id.toString(), z.oglap_code);
-      OGLAP_ZONE_CODES_BY_ID.set(Number(z.place_id), z.oglap_code);
+    if (z.place_id == null || !z.oglap_code) continue;
+    const code = String(z.oglap_code).trim().toUpperCase();
+    OGLAP_ZONE_CODES_BY_ID.set(String(z.place_id), code);
+    const numId = Number(z.place_id);
+    if (Number.isFinite(numId)) {
+      OGLAP_ZONE_CODES_BY_ID.set(numId, code);
+    }
+    if (z.parent_region_iso) {
+      if (!OGLAP_EXPLICIT_ZONE_CODES_BY_REGION.has(z.parent_region_iso)) {
+        OGLAP_EXPLICIT_ZONE_CODES_BY_REGION.set(z.parent_region_iso, new Set());
+      }
+      OGLAP_EXPLICIT_ZONE_CODES_BY_REGION.get(z.parent_region_iso).add(code);
     }
   }
 
@@ -431,12 +524,16 @@ function _validateAndApply(profile, localitiesNaming, priorChecks = []) {
   );
   GGP_PAD_CHAR = profile.zone_naming?.padding_char || 'X';
 
-  COUNTRY_SW = profile.country_extent?.country_sw || [7.19, -15.37];
-  COUNTRY_BOUNDS = {
-    sw: profile.country_extent?.country_bounds?.sw || [7.19, -15.37],
-    ne: profile.country_extent?.country_bounds?.ne || [12.68, -7.64],
-  };
+  // Bounds were schema-validated above (or init aborted). Use them directly — no fallback.
+  COUNTRY_SW = csw;
+  COUNTRY_BOUNDS = { sw: bsw, ne: bne };
   METERS_PER_DEGREE_LAT = profile.grid_settings?.distance_conversion?.meters_per_degree_lat || 111320;
+  DISTANCE_MODE = validatedDistanceMode;
+
+  // Antimeridian detection: a country crossing ±180° has NE.lon < SW.lon
+  // (e.g. Fiji sw=[-21, 176], ne=[-12, -178]). Distance math wraps longitudes
+  // east of the origin via `_normalizeLonForGrid` when this flag is true.
+  COUNTRY_CROSSES_ANTIMERIDIAN = COUNTRY_BOUNDS.ne[1] < COUNTRY_BOUNDS.sw[1];
 
   const boundsArr = [COUNTRY_BOUNDS.sw, COUNTRY_BOUNDS.ne];
 
@@ -489,6 +586,7 @@ function _validateAndApply(profile, localitiesNaming, priorChecks = []) {
 export async function initOglap(profileOrOptions, localitiesNaming) {
   _initialized = false;
   _initReport = null;
+  _resetLoadedData(true);
 
   // ── Direct mode: initOglap(profileObj, localitiesObj) ──
   const isDirect = localitiesNaming !== undefined ||
@@ -603,7 +701,6 @@ export async function initOglap(profileOrOptions, localitiesNaming) {
     report.dataDir = versionDir;
     return report;
   }
-  _initialized = true;
 
   // Step 3/3: Places database (large file)
   try {
@@ -615,16 +712,26 @@ export async function initOglap(profileOrOptions, localitiesNaming) {
     report.ok = false;
     report.error = `Failed to get ${f.label}: ${err.message}`;
     report.dataDir = versionDir;
+    _initialized = false;
+    _resetLoadedData(true);
     _initReport = report;
     return report;
   }
 
   // Load places into engine
-  const loadResult = loadOglap(loaded.data);
+  _initialized = true;
+  let loadResult;
+  try {
+    loadResult = loadOglap(loaded.data);
+  } catch (err) {
+    loadResult = { ok: false, count: 0, message: `Failed to load places database: ${err.message}` };
+  }
   report.checks.push({ id: 'data.load', status: loadResult.ok ? 'pass' : 'fail', message: loadResult.message });
   if (!loadResult.ok) {
     report.ok = false;
     report.error = loadResult.message;
+    _initialized = false;
+    _resetLoadedData(true);
   }
   report.dataLoaded = loadResult;
   report.dataDir = versionDir;
@@ -637,6 +744,34 @@ let places = [];
 let lapSearchIndex = null;
 let upperAdminLetterCache = new Map();
 let adminLevel6PlacesCache = null;
+let adminLevel4PlacesCache = null;
+/** @type {Map<string, Map<string|number, string>>} ISO -> (place_id -> admin_level_3 code) */
+let adminLevel2AssignmentCache = new Map();
+/** @type {Map<string|number, string>} place_id -> effective admin_level_2 ISO */
+let placeEffectiveIsoCache = new Map();
+/** @type {Flatbush|null} Static R-tree over polygon bboxes — O(log N) candidate lookup for reverseGeocode. */
+let placesRTree = null;
+/** @type {Int32Array|null} Maps rtree node ordinal → index into `places`. */
+let placesRTreeIdx = null;
+/** @type {WeakMap<Object, number[]>} Geometry bbox cache that does not mutate caller place objects. */
+let placeBboxCache = new WeakMap();
+/** @type {WeakMap<Object, number>} Geometry area cache that does not mutate caller place objects. */
+let placeAreaCache = new WeakMap();
+
+function _resetLoadedData(clearPlaces = true) {
+  lapSearchIndex = null;
+  upperAdminLetterCache.clear();
+  adminLevel6PlacesCache = null;
+  adminLevel4PlacesCache = null;
+  adminLevel2AssignmentCache.clear();
+  placeEffectiveIsoCache.clear();
+  placesRTree = null;
+  placesRTreeIdx = null;
+  placeBboxCache = new WeakMap();
+  placeAreaCache = new WeakMap();
+  COUNTRY_BORDER_GEOJSON = null;
+  if (clearPlaces) places = [];
+}
 
 /**
  * Loads geojson places into the in-memory engine. Clears existing search and geometry caches.
@@ -647,35 +782,29 @@ let adminLevel6PlacesCache = null;
  * @returns {{ ok: boolean, count: number, message: string }}
  */
 export function loadOglap(data) {
-  lapSearchIndex = null;
-  upperAdminLetterCache.clear();
-  adminLevel6PlacesCache = null;
+  _resetLoadedData(true);
 
   if (!_initialized) {
-    places = [];
     return { ok: false, count: 0, message: 'Cannot load data: initOglap must be called first with a valid profile and localities naming.' };
   }
   if (!Array.isArray(data)) {
-    places = [];
     return { ok: false, count: 0, message: 'Data must be an array of place objects.' };
   }
   if (data.length === 0) {
-    places = [];
     return { ok: false, count: 0, message: 'Data array is empty — no places to load.' };
   }
 
-  // Spot-check: first entry should look like a place object
-  const sample = data[0];
-  if (typeof sample !== 'object' || sample === null) {
-    places = [];
-    return { ok: false, count: 0, message: 'Data entries are not valid objects.' };
-  }
-  const hasGeometry = !!sample.geojson;
-  const hasAddress = !!sample.address;
-  const hasPlaceId = sample.place_id != null;
-  if (!hasPlaceId && !hasGeometry && !hasAddress) {
-    places = [];
-    return { ok: false, count: 0, message: 'Data entries do not appear to be OGLAP place objects (missing place_id, geojson, and address).' };
+  for (let i = 0; i < data.length; i++) {
+    const entry = data[i];
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return { ok: false, count: 0, message: `Data entry at index ${i} is not a valid place object.` };
+    }
+    const hasGeometry = !!entry.geojson;
+    const hasAddress = entry.address != null;
+    const hasPlaceId = entry.place_id != null;
+    if (!hasPlaceId && !hasGeometry && !hasAddress) {
+      return { ok: false, count: 0, message: `Data entry at index ${i} does not appear to be an OGLAP place object (missing place_id, geojson, and address).` };
+    }
   }
 
   places = data;
@@ -690,12 +819,89 @@ export function loadOglap(data) {
     COUNTRY_BORDER_GEOJSON = countryPlace.geojson;
   }
 
+  try {
+    // Build the R-tree spatial index eagerly. O(N) build, O(log N + K) queries.
+    // For 17K places this takes a few ms and saves ~10x on every reverseGeocode.
+    _buildPlacesRTree();
+  } catch (err) {
+    _resetLoadedData(true);
+    return { ok: false, count: 0, message: `Failed to build spatial index: ${err.message}` };
+  }
+
   const withGeometry = data.filter(p => p.geojson).length;
   return {
     ok: true,
     count: data.length,
     message: `Loaded ${data.length} places (${withGeometry} with geometry).`
   };
+}
+
+/** Return indices of places whose bbox contains (lon, lat). Uses R-tree if built,
+ *  falls back to a linear bbox scan otherwise (e.g. before any encode/decode is
+ *  called and the user invokes a lookup). Duplicates can appear when a place's
+ *  bbox was split for antimeridian — callers must deduplicate by index. */
+function _candidatePlaceIndices(lon, lat) {
+  if (placesRTree && placesRTreeIdx) {
+    const hits = placesRTree.search(lon, lat, lon, lat);
+    if (hits.length === 0) return [];
+    const out = new Array(hits.length);
+    for (let i = 0; i < hits.length; i++) out[i] = placesRTreeIdx[hits[i]];
+    return out;
+  }
+  // Fallback linear scan (only happens if loadOglap wasn't called yet).
+  const out = [];
+  for (let i = 0; i < places.length; i++) {
+    const p = places[i];
+    if (!p.geojson) continue;
+    const t = p.geojson.type;
+    if (t !== 'Polygon' && t !== 'MultiPolygon') continue;
+    const bbox = getCachedBbox(p);
+    if (bbox && _bboxContains(bbox, lat, lon)) out.push(i);
+  }
+  return out;
+}
+
+/** Build a static R-tree over polygon bboxes for fast spatial candidate lookup.
+ *  Antimeridian-crossing bboxes are split into two entries that both point at
+ *  the same place — both halves can independently match a click.
+ *  Idempotent: safe to call multiple times; cleared by loadOglap. */
+function _buildPlacesRTree() {
+  placesRTree = null;
+  placesRTreeIdx = null;
+  if (!Array.isArray(places) || places.length === 0) return;
+
+  // First pass: enumerate eligible places and their bbox entries.
+  // Each place may contribute 1 entry (normal) or 2 (antimeridian-crossing bbox).
+  const entries = []; // { idx, minLon, minLat, maxLon, maxLat }
+  for (let i = 0; i < places.length; i++) {
+    const p = places[i];
+    if (!p.geojson) continue;
+    const t = p.geojson.type;
+    if (t !== 'Polygon' && t !== 'MultiPolygon') continue;
+    const bbox = getCachedBbox(p);
+    if (!bbox) continue;
+    const minLat = bbox[0], maxLat = bbox[1], minLon = bbox[2], maxLon = bbox[3];
+    if (minLon <= maxLon) {
+      entries.push({ idx: i, minLon, minLat, maxLon, maxLat });
+    } else {
+      // bbox crosses antimeridian — split into [minLon, 180] and [-180, maxLon]
+      entries.push({ idx: i, minLon, minLat, maxLon: 180, maxLat });
+      entries.push({ idx: i, minLon: -180, minLat, maxLon, maxLat });
+    }
+  }
+
+  if (entries.length === 0) return;
+
+  const tree = new Flatbush(entries.length);
+  const idx = new Int32Array(entries.length);
+  for (let k = 0; k < entries.length; k++) {
+    const e = entries[k];
+    tree.add(e.minLon, e.minLat, e.maxLon, e.maxLat);
+    idx[k] = e.idx;
+  }
+  tree.finish();
+  placesRTree = tree;
+  placesRTreeIdx = idx;
 }
 
 /**
@@ -711,13 +917,79 @@ export function getOglapPlaces() { return places; }
 // - LAP codes are therefore stable regardless of which basemap is shown or its language.
 
 
-function metersPerDegreeLat() {
+// ──────────────────────────────────────────────────────────────────────────────
+//   Distance conversion — supports two modes, selected by profile.grid_settings.distance_mode:
+//
+//   'flat' (default, backward-compatible):
+//     mPerLat = METERS_PER_DEGREE_LAT (constant, profile-configured)
+//     mPerLon = METERS_PER_DEGREE_LAT * cos(lat)
+//     Good to ~0.6% over a country-sized region. Codes are byte-stable across
+//     profile versions as long as the constant doesn't change.
+//
+//   'wgs84_ellipsoid' (opt-in, sub-meter accurate):
+//     NOAA polynomial approximations of dM/dφ and dE/dφ for the WGS84 ellipsoid.
+//     Accurate to ~0.1 mm. Codes will differ from 'flat' mode — opt-in only for
+//     new countries / new dataset versions.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// NOAA polynomial approximations. Accurate to better than 0.001 m / degree for any latitude.
+// Source: NIMA WGS84 / NOAA "Latitude/Longitude Distance Calculator" formulas.
+function _mPerDegLatEllipsoid(latDeg) {
+  const phi = (latDeg * Math.PI) / 180;
+  return 111132.954 - 559.822 * Math.cos(2 * phi) + 1.175 * Math.cos(4 * phi);
+}
+
+function _mPerDegLonEllipsoid(latDeg) {
+  const phi = (latDeg * Math.PI) / 180;
+  return 111412.84 * Math.cos(phi) - 93.5 * Math.cos(3 * phi) + 0.118 * Math.cos(5 * phi);
+}
+
+/** Meters per degree latitude AT the given latitude. In flat mode, latDeg is ignored. */
+function metersPerDegreeLat(latDeg = 0) {
+  if (DISTANCE_MODE === 'wgs84_ellipsoid') return _mPerDegLatEllipsoid(latDeg);
   return METERS_PER_DEGREE_LAT;
 }
 
+/** Meters per degree longitude AT the given latitude. */
 function metersPerDegreeLon(latDeg) {
-  const latRad = (latDeg * Math.PI) / 180;
-  return METERS_PER_DEGREE_LAT * Math.cos(latRad);
+  if (DISTANCE_MODE === 'wgs84_ellipsoid') return _mPerDegLonEllipsoid(latDeg);
+  return METERS_PER_DEGREE_LAT * Math.cos((latDeg * Math.PI) / 180);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//   Antimeridian crossing — for countries whose longitude range spans ±180°
+//   (Fiji, Kiribati, Russia/USA-Aleutians).
+//
+//   The grid math measures "meters east of origin". For non-crossing countries
+//   this is just (lon - originLon) * mPerLon. For crossing countries, a click
+//   slightly EAST of the country's eastern edge has a longitude numerically
+//   LESS than the origin. Normalizing by +360° puts it back on the correct
+//   side of the origin. The helpers below are no-ops for non-crossing countries.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/** Returns a longitude shifted by +360° if it is west of `originLon` AND the country
+ *  spans the antimeridian. Otherwise returns lon unchanged. */
+function _normalizeLonForGrid(lon, originLon) {
+  if (!COUNTRY_CROSSES_ANTIMERIDIAN) return lon;
+  return lon < originLon ? lon + 360 : lon;
+}
+
+/** True iff lon is inside the country's longitude range, accounting for antimeridian crossing. */
+function _isLonInCountryRange(lon) {
+  const swLon = COUNTRY_BOUNDS.sw[1];
+  const neLon = COUNTRY_BOUNDS.ne[1];
+  if (COUNTRY_CROSSES_ANTIMERIDIAN) return lon >= swLon || lon <= neLon;
+  return lon >= swLon && lon <= neLon;
+}
+
+/** True iff a bbox [minLat, maxLat, minLon, maxLon] contains the point.
+ *  Handles bboxes that themselves cross the antimeridian (minLon > maxLon). */
+function _bboxContains(bbox, lat, lon) {
+  if (lat < bbox[0] || lat > bbox[1]) return false;
+  const minLon = bbox[2], maxLon = bbox[3];
+  if (minLon <= maxLon) return lon >= minLon && lon <= maxLon;
+  // bbox crosses antimeridian
+  return lon >= minLon || lon <= maxLon;
 }
 
 /**
@@ -783,13 +1055,20 @@ function stripPrefecturePrefix(name) {
 function getAdminLevel6NameFromContainment(lon, lat) {
   if (!Array.isArray(places) || places.length === 0) return null;
   if (!adminLevel6PlacesCache) {
-    adminLevel6PlacesCache = places.filter((p) => {
+    adminLevel6PlacesCache = new Set();
+    for (const p of places) {
       const level = p.extratags?.admin_level != null ? parseInt(p.extratags.admin_level, 10) : 0;
-      return level === 6;
-    });
+      if (level === 6 && p.geojson) adminLevel6PlacesCache.add(p);
+    }
   }
-  for (const place of adminLevel6PlacesCache) {
-    if (!place?.geojson) continue;
+  // Walk R-tree candidates, only consider admin_level=6 ones.
+  const candidates = _candidatePlaceIndices(lon, lat);
+  const seen = new Set();
+  for (const i of candidates) {
+    if (seen.has(i)) continue;
+    seen.add(i);
+    const place = places[i];
+    if (!adminLevel6PlacesCache.has(place)) continue;
     if (!pointInGeometry(lon, lat, place.geojson)) continue;
     const pAddress = place.address || {};
     const iso6 = getAdminLevel6IsoFromAddress(pAddress);
@@ -852,8 +1131,8 @@ function nameKeyFromTokens(significantTokens, address, place = null) {
 function nameKeyFallbackA(significantTokens, address) {
   if (!significantTokens.length || !address?.state) return null;
   const two = consonantAbbrev2(significantTokens);
-  const stateFirst = (address.state || '').slice(0, 1).toUpperCase();
-  if (!/[A-Z]/.test(stateFirst)) return null;
+  const stateFirst = normalizedFirstLetter(address.state);
+  if (!stateFirst) return null;
   return (two + stateFirst).slice(0, 3);
 }
 
@@ -885,9 +1164,11 @@ function zoneCodeFromNameAndType(name, typePrefix, address) {
  */
 function getCachedBbox(place) {
   if (!place || !place.geojson) return null;
-  if (place._computedBbox) return place._computedBbox;
-  place._computedBbox = bboxFromGeometry(place.geojson);
-  return place._computedBbox;
+  const cached = placeBboxCache.get(place);
+  if (cached) return cached;
+  const bbox = bboxFromGeometry(place.geojson);
+  if (bbox) placeBboxCache.set(place, bbox);
+  return bbox;
 }
 
 /** 
@@ -932,54 +1213,97 @@ function getTypePrefixForZone(placeType, adminLevel) {
   return ZONE_TYPE_PREFIX_DEFAULT;
 }
 
+function comparePlaceIds(a, b) {
+  const aId = a?.place_id ?? '';
+  const bId = b?.place_id ?? '';
+  const aNum = Number(aId);
+  const bNum = Number(bId);
+  if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) return aNum - bNum;
+  const aStr = String(aId);
+  const bStr = String(bId);
+  if (aStr < bStr) return -1;
+  if (aStr > bStr) return 1;
+  return 0;
+}
+
+function getExplicitZoneCodeForPlace(place) {
+  const pid = place?.place_id;
+  if (pid == null) return null;
+  if (OGLAP_ZONE_CODES_BY_ID.has(pid)) return OGLAP_ZONE_CODES_BY_ID.get(pid);
+  const key = String(pid);
+  return OGLAP_ZONE_CODES_BY_ID.get(key) || null;
+}
+
 /**
  * GGP Section 10 — Collision avoidance: build deterministic assignment of zone codes per ADMIN_LEVEL_2.
- * For each place in the same ADMIN_LEVEL_2: try base code, then fallback A, then base[0:3]+digit 0–9.
+ * For each place in the same ADMIN_LEVEL_2: try base code, then fallback A, then a deterministic suffix.
  * Uses effective ADMIN_LEVEL_2 (from address, then region containment, then sampling) so all places get a bucket.
  */
 function buildAdminLevel2ZoneAssignments(admin_level_2_Iso) {
   const isoKey = admin_level_2_Iso || '';
+  if (adminLevel2AssignmentCache.has(isoKey)) return adminLevel2AssignmentCache.get(isoKey);
   const inAdminLevel2 = places.filter((p) => effectiveAdminLevel2IsoForPlace(p, { skipSampling: true }) === isoKey);
-  const sorted = [...inAdminLevel2].sort((a, b) => (a.place_id || 0) - (b.place_id || 0));
+  // Sort by place_id deterministically. Avoid localeCompare — it returns
+  // different orderings across locales (TR, DE, FR all sort A-Z differently).
+  const sorted = [...inAdminLevel2].sort(comparePlaceIds);
   const used = new Set();
-  const digitCountByBase = new Map(); // base prefix (3 chars) -> next digit to use
+  const suffixCountByBase = new Map(); // base prefix (3 chars) -> next suffix index to use
   const assignment = new Map(); // place_id -> finalCode
 
+  // Explicit localities naming codes are authoritative. Reserve them first so
+  // generated fallback codes cannot steal a published code and break decode.
+  for (const code of OGLAP_EXPLICIT_ZONE_CODES_BY_REGION.get(isoKey) || []) {
+    used.add(code);
+  }
   for (const place of sorted) {
+    const explicitCode = getExplicitZoneCodeForPlace(place);
+    if (!explicitCode) continue;
+    used.add(explicitCode);
+    assignment.set(place.place_id, explicitCode);
+  }
+
+  for (const place of sorted) {
+    if (assignment.has(place.place_id)) continue;
     const { baseCode, fallbackCode } = getPlaceZoneCandidates(place);
     const prefix3 = baseCode.slice(0, 3);
     let finalCode = null;
     if (!used.has(baseCode)) {
       finalCode = baseCode;
-    } else if (fallbackCode && !used.has(fallbackCode)) {
+    } else if (fallbackCode && fallbackCode !== baseCode && !used.has(fallbackCode)) {
       finalCode = fallbackCode;
     } else {
-      const next = digitCountByBase.get(prefix3) ?? 0;
-      const digit = Math.min(9, next);
-      digitCountByBase.set(prefix3, next + 1);
-      finalCode = prefix3 + String(digit);
+      finalCode = nextCollisionCode(prefix3, used, suffixCountByBase);
     }
     used.add(finalCode);
     assignment.set(place.place_id, finalCode);
   }
+  adminLevel2AssignmentCache.set(isoKey, assignment);
   return assignment;
 }
 
 /** Get effective ADMIN_LEVEL_2 ISO for a place (for grouping). skipSampling=true when building index (faster). */
 function effectiveAdminLevel2IsoForPlace(place, opts = {}) {
+  if (!place) return null;
+  const pid = place.place_id;
+  // Cache only when sampling is skipped (i.e. fully deterministic from address/centroid).
+  const cacheable = pid != null && (opts.skipSampling === true);
+  if (cacheable && placeEffectiveIsoCache.has(pid)) return placeEffectiveIsoCache.get(pid);
   const cen = centroidFromPlace(place);
-  if (cen) return getAdminLevel2IsoWithFallback(cen[0], cen[1], place, opts);
-  return getAdminLevel2IsoFromAddress(place.address || {}) || null;
+  const iso = cen
+    ? getAdminLevel2IsoWithFallback(cen[0], cen[1], place, opts)
+    : (getAdminLevel2IsoFromAddress(place.address || {}) || null);
+  if (cacheable) placeEffectiveIsoCache.set(pid, iso);
+  return iso;
 }
 
 /** Get ADMIN_LEVEL_3 zone code for a place, respecting manual localities naming overrides first, with fallback to mathematical collision resolution within its ADMIN_LEVEL_2. */
 function getAdminLevel3CodeWithCollision(place) {
   if (!place) return null;
   // Use explicit zone code from localities naming data if present!
-  if (place.place_id && OGLAP_ZONE_CODES_BY_ID.has(place.place_id)) {
-    return OGLAP_ZONE_CODES_BY_ID.get(place.place_id);
-  }
-  const admin_level_2_Iso = effectiveAdminLevel2IsoForPlace(place);
+  const explicitCode = getExplicitZoneCodeForPlace(place);
+  if (explicitCode) return explicitCode;
+  // Use skipSampling for deterministic + cache-friendly resolution (must match buildLapSearchIndex).
+  const admin_level_2_Iso = effectiveAdminLevel2IsoForPlace(place, { skipSampling: true });
   const assignments = buildAdminLevel2ZoneAssignments(admin_level_2_Iso);
   return assignments.get(place.place_id) ?? getPlaceZoneCandidates(place).baseCode;
 }
@@ -1006,12 +1330,74 @@ function getAdminLevel3Code(address, placeType, displayName, adminLevel) {
 //                                 100 m cells, 1 m microspot.
 // Grid capacity: 17 576 × 100 m = 1 757.6 km per axis — enough for any country.
 const ALPHA3_MAX = 26 ** 3; // 17 576
+const LOCAL_CELL_SIZE_M = 100;
+const LOCAL_AXIS_BLOCKS = 100; // A0..J9 = 100 addressable 100 m blocks per axis.
+const LOCAL_GRID_SPAN_M = LOCAL_CELL_SIZE_M * LOCAL_AXIS_BLOCKS;
 const NATIONAL_CELL_SIZE_M = 100;
 const NATIONAL_MICRO_SCALE = 1;
+const GRID_EPSILON_M = 1e-4;
+const COLLISION_SUFFIX_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const MAX_ZONE_CODE_LENGTH = 8;
+const ZONE_CODE_RE = new RegExp(`^[A-Z0-9]{1,${MAX_ZONE_CODE_LENGTH}}$`);
+const LOCAL_MACROBLOCK_RE = /^[A-J]\d[A-J]\d$/i;
+const NATIONAL_MACROBLOCK_RE = /^[A-Z]{6}$/;
+const MICROSPOT_RE = /^\d{4}$/;
+
+function isValidZoneCode(code) {
+  return typeof code === 'string' && ZONE_CODE_RE.test(code);
+}
+
+function isOffsetWithinLocalGrid(eastM, northM) {
+  return (
+    eastM >= -GRID_EPSILON_M &&
+    northM >= -GRID_EPSILON_M &&
+    eastM < LOCAL_GRID_SPAN_M &&
+    northM < LOCAL_GRID_SPAN_M
+  );
+}
+
+function isPointWithinLocalGrid(lat, lon, originLat, originLon) {
+  const effectiveLon = _normalizeLonForGrid(lon, originLon);
+  const eastM = (effectiveLon - originLon) * metersPerDegreeLon(originLat);
+  const northM = (lat - originLat) * metersPerDegreeLat(originLat);
+  return isOffsetWithinLocalGrid(eastM + GRID_EPSILON_M, northM + GRID_EPSILON_M);
+}
+
+function nextCollisionCode(prefix, used, counters) {
+  let next = counters.get(prefix) ?? 0;
+  // Bound the loop. prefix is 3 chars, so suffix may be up to (MAX_ZONE_CODE_LENGTH - 3).
+  // With base-36 suffixes that gives 36^5 = 60_466_176 codes per prefix — far more than any
+  // realistic admin_level_2 will ever hold. We still cap defensively to surface logic bugs.
+  const maxSuffixLen = Math.max(1, MAX_ZONE_CODE_LENGTH - prefix.length);
+  const hardLimit = 36 ** maxSuffixLen;
+  for (; ;) {
+    if (next >= hardLimit) {
+      throw new Error(
+        `OGLAP collision overflow: exhausted ${hardLimit} suffixes for zone prefix "${prefix}". ` +
+        'This indicates a data anomaly — more places share this name+upper-admin signature than ' +
+        'the addressing scheme can disambiguate within the configured MAX_ZONE_CODE_LENGTH.'
+      );
+    }
+    const suffix = next < COLLISION_SUFFIX_ALPHABET.length
+      ? COLLISION_SUFFIX_ALPHABET[next]
+      : next.toString(36).toUpperCase();
+    next += 1;
+    const candidate = prefix + suffix;
+    if (candidate.length > MAX_ZONE_CODE_LENGTH) {
+      // Unreachable under hardLimit, but defend against future MAX_ZONE_CODE_LENGTH changes.
+      throw new Error(`OGLAP collision candidate "${candidate}" exceeds MAX_ZONE_CODE_LENGTH (${MAX_ZONE_CODE_LENGTH}).`);
+    }
+    if (!used.has(candidate)) {
+      counters.set(prefix, next);
+      return candidate;
+    }
+  }
+}
 
 /** Encode integer 0..17 575 as 3 A-Z letters (AAA..ZZZ). */
 function encodeAlpha3(n) {
-  const val = Math.max(0, Math.min(Math.floor(n), ALPHA3_MAX - 1));
+  const safe = Number.isFinite(n) ? Math.floor(n) : 0;
+  const val = Math.max(0, Math.min(safe, ALPHA3_MAX - 1));
   const c2 = val % 26;
   const c1 = Math.floor(val / 26) % 26;
   const c0 = Math.floor(val / 676);
@@ -1038,25 +1424,29 @@ function macroLetter(n) {
 
 /** Encode local macroblock (zone): eastBlocks, northBlocks (100 m) → 4-char e.g. C2E6. */
 function encodeLocalMacroblock(eastBlocks, northBlocks) {
-  const eTens = Math.floor(eastBlocks / 10);
-  const eUnits = Math.floor(eastBlocks % 10);
-  const nTens = Math.floor(northBlocks / 10);
-  const nUnits = Math.floor(northBlocks % 10);
-  return (
-    macroLetter(eTens) + eUnits +
-    macroLetter(nTens) + nUnits
-  );
+  // Defensive clamp: the gate isPointWithinLocalGrid prevents out-of-range inputs at runtime,
+  // but a future caller or refactor must not be able to produce an invalid macroblock.
+  const e = Math.max(0, Math.min(LOCAL_AXIS_BLOCKS - 1, Math.floor(eastBlocks)));
+  const n = Math.max(0, Math.min(LOCAL_AXIS_BLOCKS - 1, Math.floor(northBlocks)));
+  const eTens = Math.floor(e / 10);
+  const eUnits = e % 10;
+  const nTens = Math.floor(n / 10);
+  const nUnits = n % 10;
+  return macroLetter(eTens) + eUnits + macroLetter(nTens) + nUnits;
 }
 
-/** Encode national macroblock: eastKm, northKm → 6-char XXXYYY. */
-function encodeNationalMacroblock(eastKm, northKm) {
-  return encodeAlpha3(eastKm) + encodeAlpha3(northKm);
+/** Encode national macroblock: eastBlocks, northBlocks → 6-char XXXYYY. encodeAlpha3 already clamps to [0, ALPHA3_MAX-1]. */
+function encodeNationalMacroblock(eastBlocks, northBlocks) {
+  return encodeAlpha3(eastBlocks) + encodeAlpha3(northBlocks);
 }
 
 /** Encode microspot: 0–99 east, 0–99 north → 4 digits e.g. 5020. */
 function encodeMicrospot(eastM, northM) {
-  const e = Math.min(99, Math.max(0, Math.round(eastM)));
-  const n = Math.min(99, Math.max(0, Math.round(northM)));
+  // Guard against NaN — Math.round(NaN) = NaN, Math.max(0, NaN) = NaN.
+  const eRaw = Number.isFinite(eastM) ? Math.round(eastM) : 0;
+  const nRaw = Number.isFinite(northM) ? Math.round(northM) : 0;
+  const e = Math.min(99, Math.max(0, eRaw));
+  const n = Math.min(99, Math.max(0, nRaw));
   return String(e).padStart(2, '0') + String(n).padStart(2, '0');
 }
 
@@ -1074,13 +1464,13 @@ function decodeMacroLetter(c) {
 function decodeMacroblock(str) {
   if (!str || str.length < 4) return null;
   const u = str.toUpperCase();
-  if (u.length === 6 && /^[A-Z]{6}$/.test(u)) {
+  if (u.length === 6 && NATIONAL_MACROBLOCK_RE.test(u)) {
     const eastKm = decodeAlpha3(u.slice(0, 3));
     const northKm = decodeAlpha3(u.slice(3, 6));
     if (eastKm < 0 || northKm < 0) return null;
     return { blockEast: eastKm, blockNorth: northKm };
   }
-  if (u.length >= 4 && /^[A-J]\d[A-J]\d$/.test(u.slice(0, 4))) {
+  if (u.length === 4 && LOCAL_MACROBLOCK_RE.test(u)) {
     const blockEast = decodeMacroLetter(u[0]) * 10 + parseInt(u[1], 10);
     const blockNorth = decodeMacroLetter(u[2]) * 10 + parseInt(u[3], 10);
     if (Number.isNaN(blockNorth)) return null;
@@ -1092,6 +1482,7 @@ function decodeMacroblock(str) {
 /** Decode microspot string "9921" → { eastM, northM } (meters within the 100 m block). */
 function decodeMicrospot(str) {
   if (!str || str.length !== 4) return null;
+  if (!MICROSPOT_RE.test(str)) return null;
   const eastM = parseInt(str.slice(0, 2), 10);
   const northM = parseInt(str.slice(2, 4), 10);
   if (Number.isNaN(eastM) || Number.isNaN(northM)) return null;
@@ -1135,14 +1526,17 @@ function lapToCoordinates(lapCode) {
     originLon = bbox[2]; // minLon
   }
 
-  const mPerLat = metersPerDegreeLat();
+  const mPerLat = metersPerDegreeLat(originLat);
   const isNational = parsed.macroblock.length === 6;
   const cellSize = isNational ? NATIONAL_CELL_SIZE_M : 100;
   const microScale = isNational ? NATIONAL_MICRO_SCALE : 1;
   const eastM = macro.blockEast * cellSize + micro.eastM * microScale;
   const northM = macro.blockNorth * cellSize + micro.northM * microScale;
   const lat = originLat + northM / mPerLat;
-  const lon = originLon + eastM / metersPerDegreeLon(originLat);
+  let lon = originLon + eastM / metersPerDegreeLon(originLat);
+  // Wrap longitudes that overflowed past +180° for antimeridian-crossing countries.
+  if (lon > 180) lon -= 360;
+  else if (lon < -180) lon += 360;
   return { lat, lon };
 }
 
@@ -1152,21 +1546,22 @@ function lapToCoordinates(lapCode) {
  * National: COUNTRY-ADMIN2-MACROBLOCK(6)-MICROSPOT         (100 m cells, 1 m micro)
  */
 function computeLAP(lat, lon, originLat, originLon, admin_level_2_Code, admin_level_3_code, useNationalGrid = false) {
-  const mPerLat = metersPerDegreeLat();
+  const mPerLat = metersPerDegreeLat(originLat);
   const mPerLon = metersPerDegreeLon(originLat);
+  const effectiveLon = _normalizeLonForGrid(lon, originLon);
   const northM = (lat - originLat) * mPerLat;
-  const eastM = (lon - originLon) * mPerLon;
+  const eastM = (effectiveLon - originLon) * mPerLon;
 
   // JS Float64 precision loss compensation when parsing exact grid boundaries
-  const EPSILON = 1e-4;
-  const northMEps = northM + EPSILON;
-  const eastMEps = eastM + EPSILON;
+  const northMEps = northM + GRID_EPSILON_M;
+  const eastMEps = eastM + GRID_EPSILON_M;
 
   const admin2 = admin_level_2_Code;
 
   if (useNationalGrid) {
     const blockEastN = Math.max(0, Math.floor(eastMEps / NATIONAL_CELL_SIZE_M));
     const blockNorthN = Math.max(0, Math.floor(northMEps / NATIONAL_CELL_SIZE_M));
+    if (blockEastN >= ALPHA3_MAX || blockNorthN >= ALPHA3_MAX) return null;
     const inCellEast = Math.floor((eastMEps - blockEastN * NATIONAL_CELL_SIZE_M) / NATIONAL_MICRO_SCALE);
     const inCellNorth = Math.floor((northMEps - blockNorthN * NATIONAL_CELL_SIZE_M) / NATIONAL_MICRO_SCALE);
     const macroblock = encodeNationalMacroblock(blockEastN, blockNorthN);
@@ -1182,10 +1577,14 @@ function computeLAP(lat, lon, originLat, originLon, admin_level_2_Code, admin_le
     };
   }
 
-  const blockEast = Math.floor(eastMEps / 100);
-  const blockNorth = Math.floor(northMEps / 100);
-  const inBlockEast = eastMEps - blockEast * 100;
-  const inBlockNorth = northMEps - blockNorth * 100;
+  if (!isOffsetWithinLocalGrid(eastMEps, northMEps)) {
+    throw new Error('Local grid offset is outside the 10 km x 10 km addressable range.');
+  }
+
+  const blockEast = Math.floor(eastMEps / LOCAL_CELL_SIZE_M);
+  const blockNorth = Math.floor(northMEps / LOCAL_CELL_SIZE_M);
+  const inBlockEast = eastMEps - blockEast * LOCAL_CELL_SIZE_M;
+  const inBlockNorth = northMEps - blockNorth * LOCAL_CELL_SIZE_M;
   const macroblock = encodeLocalMacroblock(blockEast, blockNorth);
   const microspot = encodeMicrospot(inBlockEast, inBlockNorth);
 
@@ -1219,28 +1618,99 @@ function bboxFromGeometry(geometry) {
   if (!geometry?.coordinates) return null;
   const c = geometry.coordinates;
   const type = geometry.type;
-  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  let minLat = Infinity, maxLat = -Infinity;
+  let rawMin = Infinity, rawMax = -Infinity;
+  const lons = [];
+  let count = 0;
+  function _wrapLon(x) {
+    if (!Number.isFinite(x)) return x;
+    let v = x;
+    while (v > 180) v -= 360;
+    while (v < -180) v += 360;
+    return v;
+  }
   function add(lon, lat) {
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
     if (lat < minLat) minLat = lat;
     if (lat > maxLat) maxLat = lat;
-    if (lon < minLon) minLon = lon;
-    if (lon > maxLon) maxLon = lon;
+    const w = _wrapLon(lon);
+    if (w < rawMin) rawMin = w;
+    if (w > rawMax) rawMax = w;
+    lons.push(w);
+    count++;
+  }
+  function addCoord(p) {
+    if (!Array.isArray(p) || p.length < 2) return;
+    add(Number(p[0]), Number(p[1]));
   }
   if (type === 'Point') {
-    add(c[0], c[1]);
+    addCoord(c);
   } else if (type === 'Polygon') {
-    c.forEach(ring => ring.forEach(p => add(p[0], p[1])));
+    for (const ring of c) {
+      if (!Array.isArray(ring)) continue;
+      for (const p of ring) addCoord(p);
+    }
   } else if (type === 'MultiPolygon') {
-    c.forEach(poly => poly.forEach(ring => ring.forEach(p => add(p[0], p[1]))));
+    for (const poly of c) {
+      if (!Array.isArray(poly)) continue;
+      for (const ring of poly) {
+        if (!Array.isArray(ring)) continue;
+        for (const p of ring) addCoord(p);
+      }
+    }
   }
-  if (minLat === Infinity) return null;
+  if (minLat === Infinity || count === 0) return null;
+
+  // Choose the smallest longitude arc on the globe only when it is strictly
+  // narrower than the raw bbox and at most half the world. For an antimeridian
+  // geometry, that arc wraps (minLon > maxLon); for ordinary geometries, raw
+  // min/max remains the bbox.
+  const rawSpan = rawMax - rawMin;
+  let minLon, maxLon;
+  const sortedLons = [...new Set(lons)].sort((a, b) => a - b);
+  if (sortedLons.length > 1) {
+    let maxGap = -1;
+    let maxGapIdx = 0;
+    for (let i = 0; i < sortedLons.length; i++) {
+      const next = (i + 1) % sortedLons.length;
+      const gap = next === 0
+        ? (sortedLons[0] + 360) - sortedLons[i]
+        : sortedLons[next] - sortedLons[i];
+      if (gap > maxGap) {
+        maxGap = gap;
+        maxGapIdx = i;
+      }
+    }
+    const compactSpan = 360 - maxGap;
+    const arcStart = sortedLons[(maxGapIdx + 1) % sortedLons.length];
+    const arcEnd = sortedLons[maxGapIdx];
+    if (compactSpan < rawSpan && compactSpan <= 180) {
+      minLon = arcStart;
+      maxLon = arcEnd;
+    } else {
+      minLon = rawMin;
+      maxLon = rawMax;
+    }
+  } else {
+    minLon = rawMin;
+    maxLon = rawMax;
+  }
   return [minLat, maxLat, minLon, maxLon];
 }
 
-/** Centroid [lat, lon] from bbox [minLat, maxLat, minLon, maxLon]. */
+/** Centroid [lat, lon] from bbox [minLat, maxLat, minLon, maxLon]. Handles antimeridian-wrapped bboxes (minLon > maxLon). */
 function centroidFromBbox(bbox) {
   if (!bbox || bbox.length < 4) return null;
-  return [(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2];
+  const lat = (bbox[0] + bbox[1]) / 2;
+  let lon;
+  if (bbox[2] <= bbox[3]) {
+    lon = (bbox[2] + bbox[3]) / 2;
+  } else {
+    // Wrapped bbox: average via the antimeridian-crossing path.
+    lon = (bbox[2] + bbox[3] + 360) / 2;
+    if (lon > 180) lon -= 360;
+  }
+  return [lat, lon];
 }
 
 /** Build search index: key "${admin_level_2_Iso}_${admin_level_3_code}" -> first place with that zone code. Uses effective ADMIN_LEVEL_2. */
@@ -1248,19 +1718,27 @@ function buildLapSearchIndex() {
   if (lapSearchIndex) return lapSearchIndex;
   lapSearchIndex = new Map();
   const isoToAssignment = new Map();
-  for (const place of places) {
+  const sortedPlaces = [...places].sort(comparePlaceIds);
+
+  // Pass 1: explicit localities naming codes win over any generated code.
+  for (const place of sortedPlaces) {
+    const iso = effectiveAdminLevel2IsoForPlace(place, { skipSampling: true });
+    const code = getExplicitZoneCodeForPlace(place);
+    if (!iso || !code) continue;
+    const key = `${iso}_${code}`;
+    if (!lapSearchIndex.has(key)) lapSearchIndex.set(key, place);
+  }
+
+  // Pass 2: generated fallback codes fill the remaining keys, avoiding explicit
+  // reservations through buildAdminLevel2ZoneAssignments().
+  for (const place of sortedPlaces) {
+    if (getExplicitZoneCodeForPlace(place)) continue;
     const iso = effectiveAdminLevel2IsoForPlace(place, { skipSampling: true });
 
-    let code = OGLAP_ZONE_CODES_BY_ID.has(place.place_id)
-      ? OGLAP_ZONE_CODES_BY_ID.get(place.place_id)
-      : null;
-
-    if (!code) {
-      if (!isoToAssignment.has(iso)) {
-        isoToAssignment.set(iso, buildAdminLevel2ZoneAssignments(iso));
-      }
-      code = isoToAssignment.get(iso).get(place.place_id);
+    if (!isoToAssignment.has(iso)) {
+      isoToAssignment.set(iso, buildAdminLevel2ZoneAssignments(iso));
     }
+    const code = isoToAssignment.get(iso).get(place.place_id);
 
     if (!code) continue;
     const key = `${iso}_${code}`;
@@ -1279,30 +1757,39 @@ function buildLapSearchIndex() {
  * @param {string} query - The raw user input string.
  * @returns {{ admin_level_2_Iso?: string, admin_level_3_code?: string|null, macroblock?: string, microspot?: string, isNationalGrid?: boolean }|null} Structured components or null if parsing fails.
  */
+/** Safely coerce any input to a trimmed string. Returns '' for non-strings (numbers, booleans, objects, Symbol, etc.).
+ *  Coercing numbers/booleans/objects would silently turn `123` into a "valid" zone code "123", which
+ *  is almost certainly a caller bug — surface it as an empty query (→ null) instead. */
+function _toQueryString(query) {
+  if (typeof query !== 'string') return '';
+  return query.trim();
+}
+
 function parseLapCode(query) {
-  const q = (query || '').trim();
+  const q = _toQueryString(query);
   if (!q) return null;
+  if (q.length > 64) return null; // hard cap: a valid LAP is at most ~25 chars; reject obvious garbage
   const parts = q.split(/[\s-]+/).filter(Boolean).map((p) => p.toUpperCase());
 
   // National LAP with CC: GN-ADMIN2-XXXYYY-MICRO (4 parts, macroblock = 6 chars all A-Z)
-  if (parts.length >= 4 && parts[0] === COUNTRY_CODE) {
+  if (parts.length === 4 && parts[0] === COUNTRY_CODE) {
     const admin2Code = parts[1];
     const maybeMacro = parts[2];
     const maybeMicro = parts[3];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso && maybeMacro.length === 6 && /^[A-Z]{6}$/.test(maybeMacro) && maybeMicro.length === 4 && /^\d{4}$/.test(maybeMicro)) {
+    if (admin2Iso && NATIONAL_MACROBLOCK_RE.test(maybeMacro) && MICROSPOT_RE.test(maybeMicro)) {
       return { admin_level_2_Iso: admin2Iso, admin_level_3_code: null, macroblock: maybeMacro, microspot: maybeMicro, isNationalGrid: true };
     }
   }
 
   // Local LAP with CC: GN-ADMIN2-ADMIN3-MACRO-MICRO (5 parts, macroblock = 4 chars)
-  if (parts.length >= 5 && parts[0] === COUNTRY_CODE) {
+  if (parts.length === 5 && parts[0] === COUNTRY_CODE) {
     const admin2Code = parts[1];
     const admin3Code = parts[2];
     const macroblock = parts[3];
     const microspot = parts[4];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso && admin3Code.length >= 1 && macroblock.length === 4 && microspot.length === 4) {
+    if (admin2Iso && isValidZoneCode(admin3Code) && LOCAL_MACROBLOCK_RE.test(macroblock) && MICROSPOT_RE.test(microspot)) {
       return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code, macroblock, microspot, isNationalGrid: false };
     }
   }
@@ -1313,7 +1800,7 @@ function parseLapCode(query) {
     const maybeMacro = parts[1];
     const maybeMicro = parts[2];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso && maybeMacro.length === 6 && /^[A-Z]{6}$/.test(maybeMacro) && maybeMicro.length === 4 && /^\d{4}$/.test(maybeMicro)) {
+    if (admin2Iso && NATIONAL_MACROBLOCK_RE.test(maybeMacro) && MICROSPOT_RE.test(maybeMicro)) {
       return { admin_level_2_Iso: admin2Iso, admin_level_3_code: null, macroblock: maybeMacro, microspot: maybeMicro, isNationalGrid: true };
     }
   }
@@ -1325,30 +1812,33 @@ function parseLapCode(query) {
     const macroblock = parts[2];
     const microspot = parts[3];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso && admin3Code.length >= 1 && macroblock.length === 4 && microspot.length === 4) {
+    if (admin2Iso && isValidZoneCode(admin3Code) && LOCAL_MACROBLOCK_RE.test(macroblock) && MICROSPOT_RE.test(microspot)) {
       return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code, macroblock, microspot, isNationalGrid: false };
     }
   }
 
   // Zone search with country prefix: GN-ADMIN2-ADMIN3
-  if (parts.length >= 3 && parts[0] === COUNTRY_CODE) {
+  if (parts.length === 3 && parts[0] === COUNTRY_CODE) {
     const admin2Code = parts[1];
     const admin3Code = parts[2];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso && admin3Code.length >= 1) return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code };
+    if (admin2Iso && isValidZoneCode(admin3Code)) return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code };
   }
 
   // Zone search shorthand: ADMIN2 ADMIN3
-  if (parts.length === 2 && parts[0].length <= 4 && parts[1].length <= 4) {
+  if (parts.length === 2 && parts[0].length <= 4 && parts[1].length <= MAX_ZONE_CODE_LENGTH) {
     const admin2Code = parts[0];
     const admin3Code = parts[1];
     const admin2Iso = OGLAP_COUNTRY_REGIONS_REVERSE[admin2Code];
-    if (admin2Iso) return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code };
+    if (admin2Iso && isValidZoneCode(admin3Code)) return { admin_level_2_Iso: admin2Iso, admin_level_3_code: admin3Code };
   }
 
-  // Zone code only
-  if (parts.length === 1 && parts[0].length <= 4) {
-    return { admin_level_3_code: parts[0] };
+  // Zone code only — reject obvious non-zones (country code, known admin_level_2 codes)
+  if (parts.length === 1 && isValidZoneCode(parts[0])) {
+    const tok = parts[0];
+    if (tok === COUNTRY_CODE) return null;
+    if (OGLAP_COUNTRY_REGIONS_REVERSE[tok]) return null;
+    return { admin_level_3_code: tok };
   }
   return null;
 }
@@ -1361,8 +1851,9 @@ function parseLapCode(query) {
  * @returns {string|null} Returns `null` if the format is perfectly valid, or a descriptive error message string if invalid.
  */
 function validateLapCode(query) {
-  const q = (query || '').trim();
+  const q = _toQueryString(query);
   if (!q) return 'Enter a LAP code or zone code to search.';
+  if (q.length > 64) return 'Input too long. A valid LAP code is at most ~25 characters.';
 
   const parts = q.split(/[\s-]+/).filter(Boolean).map((p) => p.toUpperCase());
   if (parts.length > 5) return `Invalid format: too many segments. Use e.g. GN-CKY-QKPC-B4A4-2798 (local) or GN-CKY-XXXYYY-2798 (national) or zone code QKAR.`;
@@ -1372,10 +1863,10 @@ function validateLapCode(query) {
     if (parts[0] !== COUNTRY_CODE) return `LAP code must start with country code "${COUNTRY_CODE}" when using 5-segment format.`;
     const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[1]];
     if (!admin2) return `Unknown region code "${parts[1]}". Use a valid ADMIN_LEVEL_2 code (e.g. CKY).`;
-    if (!parts[2] || parts[2].length < 1) return 'Zone (ADMIN_LEVEL_3) code is required.';
+    if (!isValidZoneCode(parts[2])) return `Zone (ADMIN_LEVEL_3) code must be 1-${MAX_ZONE_CODE_LENGTH} letters or digits.`;
     if (parts[3].length !== 4) return 'Local macroblock must be 4 characters (e.g. B4A4).';
-    if (!/^[A-J]\d[A-J]\d$/i.test(parts[3])) return 'Local macroblock format: letter-digit-letter-digit (e.g. B4A4).';
-    if (parts[4].length !== 4 || !/^\d{4}$/.test(parts[4])) return 'Microspot must be 4 digits (e.g. 2798).';
+    if (!LOCAL_MACROBLOCK_RE.test(parts[3])) return 'Local macroblock format: letter-digit-letter-digit (e.g. B4A4).';
+    if (!MICROSPOT_RE.test(parts[4])) return 'Microspot must be 4 digits (e.g. 2798).';
     return null;
   }
 
@@ -1385,17 +1876,17 @@ function validateLapCode(query) {
       // National with CC: GN-ADMIN2-XXXYYY-MICRO
       const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[1]];
       if (!admin2) return `Unknown region code "${parts[1]}". Use a valid ADMIN_LEVEL_2 code (e.g. CKY).`;
-      if (parts[2].length !== 6 || !/^[A-Z]{6}$/.test(parts[2])) return 'National macroblock must be 6 letters (e.g. ABCDEF).';
-      if (parts[3].length !== 4 || !/^\d{4}$/.test(parts[3])) return 'Microspot must be 4 digits (e.g. 2798).';
+      if (!NATIONAL_MACROBLOCK_RE.test(parts[2])) return 'National macroblock must be 6 letters (e.g. ABCDEF).';
+      if (!MICROSPOT_RE.test(parts[3])) return 'Microspot must be 4 digits (e.g. 2798).';
       return null;
     }
     // Local without CC: ADMIN2-ADMIN3-MACRO4-MICRO
     const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[0]];
     if (!admin2) return `Unknown region code "${parts[0]}". Use a valid ADMIN_LEVEL_2 code (e.g. CKY).`;
-    if (!parts[1] || parts[1].length < 1) return 'Zone (ADMIN_LEVEL_3) code is required.';
+    if (!isValidZoneCode(parts[1])) return `Zone (ADMIN_LEVEL_3) code must be 1-${MAX_ZONE_CODE_LENGTH} letters or digits.`;
     if (parts[2].length !== 4) return 'Local macroblock must be 4 characters (e.g. B4A4).';
-    if (!/^[A-J]\d[A-J]\d$/i.test(parts[2])) return 'Local macroblock format: letter-digit-letter-digit (e.g. B4A4).';
-    if (parts[3].length !== 4 || !/^\d{4}$/.test(parts[3])) return 'Microspot must be 4 digits (e.g. 2798).';
+    if (!LOCAL_MACROBLOCK_RE.test(parts[2])) return 'Local macroblock format: letter-digit-letter-digit (e.g. B4A4).';
+    if (!MICROSPOT_RE.test(parts[3])) return 'Microspot must be 4 digits (e.g. 2798).';
     return null;
   }
 
@@ -1405,28 +1896,27 @@ function validateLapCode(query) {
       // Zone search: GN-ADMIN2-ADMIN3
       const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[1]];
       if (!admin2) return `Unknown region code "${parts[1]}". Use a valid ADMIN_LEVEL_2 code (e.g. CKY).`;
-      if (!parts[2] || parts[2].length < 1) return 'Zone code is required.';
+      if (!isValidZoneCode(parts[2])) return `Zone code must be 1-${MAX_ZONE_CODE_LENGTH} letters or digits.`;
       return null;
     }
     // National without CC: ADMIN2-XXXYYY-MICRO
     const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[0]];
-    if (admin2 && parts[1].length === 6 && /^[A-Z]{6}$/.test(parts[1]) && parts[2].length === 4 && /^\d{4}$/.test(parts[2])) {
+    if (admin2 && NATIONAL_MACROBLOCK_RE.test(parts[1]) && MICROSPOT_RE.test(parts[2])) {
       return null;
     }
-    // Could be zone search without CC — fall through
-    if (admin2) return null; // loose zone search
+    if (admin2) return 'Three-segment codes without a country prefix must be national LAPs: ADMIN2-XXXXXX-1234.';
     return `Unknown region code "${parts[0]}". Use a valid ADMIN_LEVEL_2 code (e.g. CKY).`;
   }
 
   if (parts.length === 2) {
     const admin2 = OGLAP_COUNTRY_REGIONS_REVERSE[parts[0]];
     if (!admin2) return `Unknown region code "${parts[0]}". Use e.g. CKY QKAR.`;
-    if (!parts[1] || parts[1].length > 4) return 'Zone code must be 1–4 characters.';
+    if (!isValidZoneCode(parts[1])) return `Zone code must be 1-${MAX_ZONE_CODE_LENGTH} letters or digits.`;
     return null;
   }
 
   if (parts.length === 1) {
-    if (parts[0].length > 4) return 'Zone code only must be 1–4 characters (e.g. QKAR).';
+    if (!isValidZoneCode(parts[0])) return `Zone code only must be 1-${MAX_ZONE_CODE_LENGTH} letters or digits (e.g. QKAR).`;
     return null;
   }
 
@@ -1448,11 +1938,15 @@ function getPlaceByLapCode(query) {
     const key = `${parsed.admin_level_2_Iso}_${parsed.admin_level_3_code}`;
     place = lapSearchIndex.get(key) || null;
   } else if (parsed.admin_level_3_code) {
-    for (const [key, p] of lapSearchIndex) {
-      if (key.endsWith('_' + parsed.admin_level_3_code)) {
-        place = p;
-        break;
-      }
+    // Zone-only search: sort matching keys to guarantee stable selection across runs.
+    const suffix = '_' + parsed.admin_level_3_code;
+    const matches = [];
+    for (const key of lapSearchIndex.keys()) {
+      if (key.endsWith(suffix)) matches.push(key);
+    }
+    if (matches.length > 0) {
+      matches.sort();
+      place = lapSearchIndex.get(matches[0]);
     }
   }
   if (!place) return null;
@@ -1486,21 +1980,45 @@ function closeRings(geometry) {
   return geometry;
 }
 
-/** Check if point [lon, lat] is inside GeoJSON geometry. */
-function pointInGeometry(lon, lat, geometry) {
-  if (!geometry) return false;
-  const pt = { type: 'Point', coordinates: [lon, lat] };
+/**
+ * Get a closed-ring polygon wrapper for a geometry, cached on the geometry object itself
+ * for ordinary (mutable) inputs; falls back to a module-scoped WeakMap for frozen inputs
+ * so the closed wrapper is only built once.
+ */
+const _frozenClosedPolyCache = new WeakMap();
+function _getClosedPolyFromGeometry(geometry) {
+  if (!geometry) return null;
+  if (geometry._closedPoly) return geometry._closedPoly;
+  const cached = _frozenClosedPolyCache.get(geometry);
+  if (cached) return cached;
   let poly;
   if (geometry.type === 'Polygon') {
     poly = closeRings({ type: 'Polygon', coordinates: geometry.coordinates });
   } else if (geometry.type === 'MultiPolygon') {
     poly = closeRings({ type: 'MultiPolygon', coordinates: geometry.coordinates });
   } else {
-    return false;
+    return null;
   }
+  if (Object.isFrozen(geometry)) {
+    _frozenClosedPolyCache.set(geometry, poly);
+  } else {
+    try {
+      Object.defineProperty(geometry, '_closedPoly', { value: poly, enumerable: false, configurable: true });
+    } catch {
+      // Sealed (not frozen) or non-extensible — store off-object.
+      _frozenClosedPolyCache.set(geometry, poly);
+    }
+  }
+  return poly;
+}
+
+/** Check if point [lon, lat] is inside GeoJSON geometry. */
+function pointInGeometry(lon, lat, geometry) {
+  const poly = _getClosedPolyFromGeometry(geometry);
+  if (!poly) return false;
   try {
-    return booleanPointInPolygon(pt, poly);
-  } catch (_) {
+    return booleanPointInPolygon({ type: 'Point', coordinates: [lon, lat] }, poly);
+  } catch {
     return false;
   }
 }
@@ -1508,73 +2026,88 @@ function pointInGeometry(lon, lat, geometry) {
 /** Find smallest containing feature for (lon, lat) and return it + bbox for origin. */
 function reverseGeocode(lon, lat) {
   const containing = [];
-  for (const place of places) {
+  // Candidate set from R-tree; deduplicate places (antimeridian-split bboxes can produce duplicates).
+  const candidateIdx = _candidatePlaceIndices(lon, lat);
+  const seen = new Set();
+  for (const i of candidateIdx) {
+    if (seen.has(i)) continue;
+    seen.add(i);
+    const place = places[i];
     const geo = place.geojson;
     if (!geo) continue;
-    if (geo.type === 'Point' || geo.type === 'MultiPoint') continue;
-    if (pointInGeometry(lon, lat, geo)) {
-      const poly = geo.type === 'Polygon'
-        ? closeRings({ type: 'Polygon', coordinates: geo.coordinates })
-        : closeRings({ type: 'MultiPolygon', coordinates: geo.coordinates });
-      try {
-        if (place._computedArea === undefined) {
-          place._computedArea = area(poly);
-        }
-        containing.push({
-          place,
-          area: place._computedArea,
-        });
-      } catch (_) {
-        // skip if area() fails (e.g. invalid geometry)
+    const t = geo.type;
+    if (t !== 'Polygon' && t !== 'MultiPolygon') continue;
+    if (!pointInGeometry(lon, lat, geo)) continue;
+    const poly = _getClosedPolyFromGeometry(geo);
+    if (!poly) continue;
+    try {
+      let computedArea = placeAreaCache.get(place);
+      if (computedArea === undefined) {
+        computedArea = area(poly);
+        placeAreaCache.set(place, computedArea);
       }
+      containing.push({ place, area: computedArea });
+    } catch {
+      // skip if area() fails (e.g. invalid geometry)
     }
   }
   if (containing.length === 0) return null;
-  containing.sort((a, b) => a.area - b.area);
+  // Stable secondary key (place_id) so ties in area resolve deterministically.
+  containing.sort((a, b) => {
+    if (a.area !== b.area) return a.area - b.area;
+    const aId = a.place.place_id ?? '';
+    const bId = b.place.place_id ?? '';
+    const aNum = Number(aId), bNum = Number(bId);
+    if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) return aNum - bNum;
+    const aStr = String(aId), bStr = String(bId);
+    return aStr < bStr ? -1 : aStr > bStr ? 1 : 0;
+  });
 
   // Best (smallest) feature
   const best = containing[0].place;
 
-  // Ensure the best place has its address object initialized
-  if (!best.address) best.address = {};
-
-  // Bubble up missing hierarchical addressing properties from enclosing areas
+  // Build enriched address WITHOUT mutating the place — bubble-up only feeds the
+  // returned `humanAddress`. Zone code generation must rely on the raw place address
+  // so that codes don't depend on click order (an earlier click would otherwise
+  // mutate the place and shift later collision assignments).
+  const enriched = { ...(best.address || {}) };
   for (let i = 1; i < containing.length; i++) {
     const parent = containing[i].place;
     const parentAddr = parent.address || {};
     const parentLevel = parent.extratags?.admin_level ? parseInt(parent.extratags.admin_level, 10) : null;
     const parentName = getPlaceName(parent);
 
-    if (!best.address.country && parentAddr.country) best.address.country = parentAddr.country;
+    if (!enriched.country && parentAddr.country) enriched.country = parentAddr.country;
 
     // Admin Level 4 -> State/Region
-    if (!best.address.state) {
-      if (parentAddr.state) best.address.state = parentAddr.state;
-      else if (parentLevel === 4) best.address.state = parentName;
+    if (!enriched.state) {
+      if (parentAddr.state) enriched.state = parentAddr.state;
+      else if (parentLevel === 4) enriched.state = parentName;
     }
 
     // Admin Level 6 -> County/Prefecture
-    if (!best.address.county) {
-      if (parentAddr.county) best.address.county = parentAddr.county;
-      else if (parentLevel === 6) best.address.county = parentName;
+    if (!enriched.county) {
+      if (parentAddr.county) enriched.county = parentAddr.county;
+      else if (parentLevel === 6) enriched.county = parentName;
     }
 
     // Admin Level 8 -> City/Town/Sub-prefecture
-    if (!best.address.city && !best.address.town && !best.address.village) {
-      if (parentAddr.city) best.address.city = parentAddr.city;
-      else if (parentAddr.town) best.address.town = parentAddr.town;
-      else if (parentLevel === 8) best.address.city = parentName;
+    if (!enriched.city && !enriched.town && !enriched.village) {
+      if (parentAddr.city) enriched.city = parentAddr.city;
+      else if (parentAddr.town) enriched.town = parentAddr.town;
+      else if (parentLevel === 8) enriched.city = parentName;
     }
   }
 
   // Fallback country if still missing
-  if (!best.address.country) best.address.country = COUNTRY_PROFILE?.meta?.country_name || 'Guinée';
+  if (!enriched.country) enriched.country = COUNTRY_PROFILE?.meta?.country_name || 'Guinée';
 
   const bbox = getCachedBbox(best);
   const originLat = bbox ? bbox[0] : COUNTRY_SW[0];
   const originLon = bbox ? bbox[2] : COUNTRY_SW[1];
   return {
     place: best,
+    enrichedAddress: enriched,
     originLat,
     originLon,
     bbox,
@@ -1594,10 +2127,24 @@ function getAdminLevel2IsoFromAddress(address) {
 
 /** Find region (admin_level 4) that contains the point; return its ISO or null. */
 function getAdminLevel2FromRegionContainment(lon, lat) {
-  for (const place of places) {
-    const level = place.extratags?.admin_level != null ? parseInt(place.extratags.admin_level, 10) : 0;
-    if (level !== 4) continue;
-    const iso = getAdminLevel2IsoFromAddress(place.address || {});
+  if (!adminLevel4PlacesCache) {
+    // Map place reference → ISO, for O(1) lookup when walking R-tree candidates.
+    adminLevel4PlacesCache = new Map();
+    for (const place of places) {
+      const level = place.extratags?.admin_level != null ? parseInt(place.extratags.admin_level, 10) : 0;
+      if (level !== 4) continue;
+      const iso = getAdminLevel2IsoFromAddress(place.address || {});
+      if (!iso || !place.geojson) continue;
+      adminLevel4PlacesCache.set(place, iso);
+    }
+  }
+  const candidates = _candidatePlaceIndices(lon, lat);
+  const seen = new Set();
+  for (const i of candidates) {
+    if (seen.has(i)) continue;
+    seen.add(i);
+    const place = places[i];
+    const iso = adminLevel4PlacesCache.get(place);
     if (!iso) continue;
     if (pointInGeometry(lon, lat, place.geojson)) return iso;
   }
@@ -1606,7 +2153,7 @@ function getAdminLevel2FromRegionContainment(lon, lat) {
 
 /** Sample 3–7 points in 500m–1km radius; return majority ADMIN_LEVEL_2 ISO or null. */
 function getAdminLevel2BySampling(lon, lat, numSamples = 5, radiusM = 750) {
-  const mPerLat = metersPerDegreeLat();
+  const mPerLat = metersPerDegreeLat(lat);
   const mPerLon = metersPerDegreeLon(lat);
   const counts = new Map();
   const angles = [];
@@ -1672,8 +2219,7 @@ function useZoneGridForPlace(place) {
   const level = parseInt(place.extratags.admin_level, 10);
   if (level < 9) return false;
   // If place has a pre-assigned zone code in localities naming, use local grid
-  const pid = place.place_id;
-  if (pid != null && (OGLAP_ZONE_CODES_BY_ID.has(pid) || OGLAP_ZONE_CODES_BY_ID.has(String(pid)))) return true;
+  if (getExplicitZoneCodeForPlace(place)) return true;
   // Check if place has meaningful name tokens for zone code generation
   const address = place.address || {};
   const name = address.quarter || address.neighbourhood || address.suburb ||
@@ -1689,17 +2235,29 @@ function useZoneGridForPlace(place) {
  * National grid otherwise (country origin, XXXYYY macroblock, no ADMIN3).
  */
 function buildOGLAPResult(lat, lon, rev) {
-  const useZone = rev?.place && useZoneGridForPlace(rev.place);
+  const prefersZone = rev?.place && useZoneGridForPlace(rev.place);
+  const zoneOriginLat = rev?.originLat;
+  const zoneOriginLon = rev?.originLon;
+  const useZone = !!(
+    prefersZone &&
+    Number.isFinite(zoneOriginLat) &&
+    Number.isFinite(zoneOriginLon) &&
+    isPointWithinLocalGrid(lat, lon, zoneOriginLat, zoneOriginLon)
+  );
   const useNational = !useZone;
   let originLat, originLon, admin_level_2, admin_level_3, displayName, address, pcode;
 
   if (useZone) {
-    originLat = rev.originLat;
-    originLon = rev.originLon;
-    admin_level_2 = getAdminLevel2WithFallback(lat, lon, rev.place);
+    originLat = zoneOriginLat;
+    originLon = zoneOriginLon;
+    // Tie admin_level_2 to the place (matching the LAP search index) — not the click point.
+    // This guarantees encoded LAP ↔ index key consistency for decode round-trips.
+    const placeIso = effectiveAdminLevel2IsoForPlace(rev.place, { skipSampling: true });
+    admin_level_2 = placeIso ? OGLAP_COUNTRY_REGIONS[placeIso] : null;
+    if (!admin_level_2) admin_level_2 = getAdminLevel2WithFallback(lat, lon, rev.place);
     if (!admin_level_2) return null;
     admin_level_3 = getAdminLevel3CodeWithCollision(rev.place);
-    address = rev.place.address || {};
+    address = rev.enrichedAddress || rev.place.address || {};
     displayName = getPlaceName(rev.place);
     const pcodeRaw = rev.place.extratags?.['unocha:pcode'];
     pcode = typeof pcodeRaw === 'string' && pcodeRaw.trim()
@@ -1711,12 +2269,13 @@ function buildOGLAPResult(lat, lon, rev) {
     admin_level_2 = getAdminLevel2WithFallback(lat, lon, rev?.place ?? null);
     if (!admin_level_2) return null;
     admin_level_3 = null;
-    address = rev?.place?.address || {};
+    address = rev?.enrichedAddress || rev?.place?.address || {};
     displayName = getPlaceName(rev?.place);
     pcode = [];
   }
 
   const lap = computeLAP(lat, lon, originLat, originLon, admin_level_2, admin_level_3, useNational);
+  if (!lap) return null;
 
   const addressParts = (useNational
     ? [
@@ -1774,11 +2333,25 @@ function buildOGLAPResult(lat, lon, rev) {
 function coordinatesToLap(lat, lon) {
   if (!_initialized) throw new Error('OGLAP not initialized. Call initOglap() with a valid profile and localities naming first.');
 
-  // Fast reject: coordinates outside the country bounding box
-  const { sw, ne } = COUNTRY_BOUNDS;
-  if (lat < sw[0] || lat > ne[0] || lon < sw[1] || lon > ne[1]) {
+  // Defensive: only finite numbers are valid. String comparisons would silently coerce
+  // ("9.5" < 7.19 evaluates numerically), but NaN comparisons return false so we'd
+  // bypass the bbox gate and ship NaN through reverseGeocode. Reject early.
+  if (typeof lat !== 'number' || typeof lon !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lon)) {
     return null;
   }
+
+  // Reject obvious out-of-range WGS84 inputs (and prevents lon-wrap-around tricks).
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+
+  // Canonicalize lon = -180 → +180. The two are the SAME physical point on the antimeridian,
+  // but for an antimeridian-crossing country the choice of representation determines which
+  // side of the origin the click lands on. Always pick +180 so behavior is deterministic.
+  if (COUNTRY_CROSSES_ANTIMERIDIAN && lon === -180) lon = 180;
+
+  // Fast reject: coordinates outside the country bounding box (antimeridian-safe).
+  const { sw, ne } = COUNTRY_BOUNDS;
+  if (lat < sw[0] || lat > ne[0]) return null;
+  if (!_isLonInCountryRange(lon)) return null;
 
   // Precise reject: coordinates must fall inside the country border polygon (admin_level 2)
   if (COUNTRY_BORDER_GEOJSON && !pointInGeometry(lon, lat, COUNTRY_BORDER_GEOJSON)) {
