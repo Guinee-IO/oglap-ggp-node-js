@@ -215,7 +215,16 @@ async function _fetchWithProgress(url, { onChunk, timeoutMs = 120000 } = {}) {
     clearTimeout(timer);
     throw new Error(`HTTP ${res.status}${res.statusText ? ' ' + res.statusText : ''}`);
   }
-  const total = parseInt(res.headers.get('content-length') || '0', 10);
+  // When the response is gzip-compressed (Content-Encoding: gzip), Content-Length
+  // is the compressed wire size but the chunks delivered by fetch are already
+  // decompressed bytes — using it would make the percentage overshoot 100%.
+  // The uploader writes the original size to `x-amz-meta-uncompressed-length`;
+  // when that's available we use it, otherwise we suppress the percentage.
+  const isCompressed = !!res.headers.get('content-encoding');
+  const uncompressed = parseInt(res.headers.get('x-amz-meta-uncompressed-length') || '0', 10);
+  const total = isCompressed
+    ? (uncompressed || 0)
+    : parseInt(res.headers.get('content-length') || '0', 10);
   // Fallback for environments without streaming
   if (!res.body?.getReader) {
     const text = await res.text();

@@ -297,11 +297,13 @@ getOglapPlaces();            // → Place[]   (the loaded places array — use s
 
 The SDK loads three reference files from `https://s3.guinee.io/oglap/ggp/<version>/`:
 
-| File                                | Size  | Description                                                              |
-| ----------------------------------- | ----- | ------------------------------------------------------------------------ |
-| `gn_oglap_country_profile.json`     | ~3 KB | Grid parameters, admin codes, naming rules, compatibility range          |
-| `gn_localities_naming.json`         | ~300 KB | Naming table for regions / prefectures / zones                         |
-| `gn_full.json`                      | ~37 MB | Places database with GeoJSON polygons                                   |
+| File                                | Wire size  | On disk | Description                                                       |
+| ----------------------------------- | ---------- | ------- | ----------------------------------------------------------------- |
+| `gn_oglap_country_profile.json`     | ~1 KB      | ~3 KB   | Grid parameters, admin codes, naming rules, compatibility range   |
+| `gn_localities_naming.json`         | ~25 KB     | ~300 KB | Naming table for regions / prefectures / zones                    |
+| `gn_full.json`                      | ~2.5 MB    | ~13 MB  | Places database with GeoJSON polygons                             |
+
+The CDN serves all three with `Content-Encoding: gzip`. Node's built-in `fetch` decompresses transparently, so the cached file on disk is the original JSON — you don't need to touch a gzipped file at any point.
 
 By default they are cached to `./oglap-data/latest/`. The cache directory is **gitignored** in this repo and should be gitignored in yours too — these files are reproducibly downloaded by `initOglap()`.
 
@@ -402,7 +404,7 @@ loadOglap(places);
 const code = coordinatesToLap(9.5370, -13.6773).lapCode;
 ```
 
-> ⚠️ The `gn_full.json` places database is ~37 MB uncompressed. For browser use, serve it pre-gzipped and consider lazy-loading after first paint.
+> The `gn_full.json` places database is ~13 MB on disk (~2.5 MB gzipped on the wire). The CDN serves it pre-gzipped; if you self-host, set `Content-Encoding: gzip` on the response so browsers decompress transparently. Consider lazy-loading it after first paint regardless.
 
 ---
 
